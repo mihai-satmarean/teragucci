@@ -125,6 +125,78 @@ def _check_sck_available():
         )
 
 
+_CV_BASE_EXTRACTOR_LOGGED = False
+
+
+def _extract_cv_base_bytes(base, length: int) -> bytes:
+    """Pull ``length`` bytes out of a CVPixelBuffer base-address return.
+
+    Modern pyobjc (>= 10) wraps ``CVPixelBufferGetBaseAddress``'s
+    ``void *`` return value as an ``objc.varlist``, which cannot be
+    directly cast to an int. We try several extraction strategies in
+    order of performance and stick with the first one that works,
+    logging the winning path once so the choice is visible in the
+    server log.
+    """
+    global _CV_BASE_EXTRACTOR_LOGGED
+
+    # 1. numpy buffer protocol — zero-copy fast path. Works if pyobjc
+    #    exposes the underlying bytes via the Python buffer protocol.
+    try:
+        arr = np.frombuffer(base, dtype=np.uint8, count=length)
+        out = arr.tobytes()
+        if not _CV_BASE_EXTRACTOR_LOGGED:
+            logger.info("CVPixelBuffer extraction path: numpy.frombuffer")
+            _CV_BASE_EXTRACTOR_LOGGED = True
+        return out
+    except (TypeError, ValueError):
+        pass
+
+    # 2. __c_void_p__ protocol — pyobjc's documented hook for getting a
+    #    ctypes.c_void_p out of a pointer-wrapping object.
+    try:
+        cvp = base.__c_void_p__()  # type: ignore[attr-defined]
+        addr = cvp.value
+        if addr:
+            out = ctypes.string_at(addr, length)
+            if not _CV_BASE_EXTRACTOR_LOGGED:
+                logger.info("CVPixelBuffer extraction path: __c_void_p__")
+                _CV_BASE_EXTRACTOR_LOGGED = True
+            return out
+    except (AttributeError, TypeError):
+        pass
+
+    # 3. Legacy pyobjc: void* returns were auto-converted to int.
+    try:
+        addr = int(base)
+        out = ctypes.string_at(addr, length)
+        if not _CV_BASE_EXTRACTOR_LOGGED:
+            logger.info("CVPixelBuffer extraction path: int(base)")
+            _CV_BASE_EXTRACTOR_LOGGED = True
+        return out
+    except (TypeError, ValueError):
+        pass
+
+    # 4. Last resort: slice the varlist. This invokes pyobjc's
+    #    per-element conversion and is significantly slower for large
+    #    frames, but at least the pipeline keeps running until we can
+    #    diagnose the varlist shape.
+    try:
+        out = bytes(base[:length])
+        if not _CV_BASE_EXTRACTOR_LOGGED:
+            logger.warning(
+                "CVPixelBuffer extraction path: slice fallback (SLOW). "
+                "base type=%s", type(base).__name__,
+            )
+            _CV_BASE_EXTRACTOR_LOGGED = True
+        return out
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not extract bytes from CVPixelBuffer base address "
+            f"(type={type(base).__name__}): {e}"
+        )
+
+
 if _HAS_SCK:
 
     class _StreamOutputHandler(NSObject):
@@ -168,21 +240,29 @@ if _HAS_SCK:
                     if base is None or width == 0 or height == 0:
                         return
 
-                    # PyObjC returns an int-castable pointer for the
-                    # base address. ctypes.string_at lets us pull the
-                    # raw bytes out without an extra numpy copy.
-                    base_int = int(base)
+                    # Pull raw bytes out of the CVPixelBuffer. Recent
+                    # pyobjc (10+) wraps CVPixelBufferGetBaseAddress as
+                    # an ``objc.varlist`` rather than an int-castable
+                    # pointer, so ``int(base)`` blows up. Try several
+                    # extraction paths in order of speed:
+                    #   1. buffer protocol via numpy.frombuffer (fastest)
+                    #   2. __c_void_p__ -> ctypes.string_at
+                    #   3. int(base)   -> ctypes.string_at (old pyobjc)
+                    #   4. slice iteration (slow fallback)
+                    total = height * bpr
                     row_stride = width * 4
+                    raw_full = _extract_cv_base_bytes(base, total)
+
                     if bpr == row_stride:
-                        raw = ctypes.string_at(base_int, height * bpr)
+                        raw = raw_full
                     else:
                         # Strip row padding. Build a tight buffer the
                         # encoder can consume directly.
                         out = bytearray(height * row_stride)
                         for y in range(height):
-                            src = base_int + y * bpr
+                            start = y * bpr
                             out[y * row_stride: (y + 1) * row_stride] = (
-                                ctypes.string_at(src, row_stride)
+                                raw_full[start: start + row_stride]
                             )
                         raw = bytes(out)
 
