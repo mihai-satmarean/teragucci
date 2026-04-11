@@ -132,11 +132,13 @@ def _extract_cv_base_bytes(base, length: int) -> bytes:
     """Pull ``length`` bytes out of a CVPixelBuffer base-address return.
 
     Modern pyobjc (>= 10) wraps ``CVPixelBufferGetBaseAddress``'s
-    ``void *`` return value as an ``objc.varlist``, which cannot be
-    directly cast to an int. We try several extraction strategies in
-    order of performance and stick with the first one that works,
-    logging the winning path once so the choice is visible in the
-    server log.
+    ``void *`` return as an ``objc.varlist`` whose slice decoding is
+    unpredictable between versions — sometimes ``varlist[:N]`` gives a
+    list of ints, sometimes a list of 1-byte ``bytes`` objects, and
+    int-casting may or may not yield the raw address. We try several
+    extraction strategies in order of performance and stick with the
+    first one that works, logging the winning path once so the choice
+    is visible in the server log.
     """
     global _CV_BASE_EXTRACTOR_LOGGED
 
@@ -177,24 +179,59 @@ def _extract_cv_base_bytes(base, length: int) -> bytes:
     except (TypeError, ValueError):
         pass
 
-    # 4. Last resort: slice the varlist. This invokes pyobjc's
-    #    per-element conversion and is significantly slower for large
-    #    frames, but at least the pipeline keeps running until we can
-    #    diagnose the varlist shape.
+    # 4. Slice the varlist. pyobjc may hand back:
+    #      * ``bytes`` directly — best, just return it
+    #      * ``list[int]`` — wrap in bytes()
+    #      * ``list[bytes]`` of 1-byte elements — b''.join them
+    #    All three are SLOW relative to a pointer memcpy, but at least
+    #    the pipeline keeps running. First-time use logs a warning so
+    #    we know to go hunt for a faster path.
     try:
-        out = bytes(base[:length])
-        if not _CV_BASE_EXTRACTOR_LOGGED:
-            logger.warning(
-                "CVPixelBuffer extraction path: slice fallback (SLOW). "
-                "base type=%s", type(base).__name__,
-            )
-            _CV_BASE_EXTRACTOR_LOGGED = True
-        return out
+        chunk = base[:length]
     except Exception as e:
         raise RuntimeError(
-            f"Could not extract bytes from CVPixelBuffer base address "
+            f"Could not slice CVPixelBuffer base "
             f"(type={type(base).__name__}): {e}"
         )
+
+    if isinstance(chunk, (bytes, bytearray)):
+        if not _CV_BASE_EXTRACTOR_LOGGED:
+            logger.info("CVPixelBuffer extraction path: slice -> bytes")
+            _CV_BASE_EXTRACTOR_LOGGED = True
+        return bytes(chunk)
+
+    if isinstance(chunk, memoryview):
+        if not _CV_BASE_EXTRACTOR_LOGGED:
+            logger.info("CVPixelBuffer extraction path: slice -> memoryview")
+            _CV_BASE_EXTRACTOR_LOGGED = True
+        return chunk.tobytes()
+
+    if isinstance(chunk, (list, tuple)) and chunk:
+        first = chunk[0]
+        if isinstance(first, int):
+            if not _CV_BASE_EXTRACTOR_LOGGED:
+                logger.warning(
+                    "CVPixelBuffer extraction path: slice -> list[int] "
+                    "(SLOW; element=%s)", type(first).__name__,
+                )
+                _CV_BASE_EXTRACTOR_LOGGED = True
+            return bytes(chunk)
+        if isinstance(first, (bytes, bytearray)):
+            if not _CV_BASE_EXTRACTOR_LOGGED:
+                logger.warning(
+                    "CVPixelBuffer extraction path: slice -> list[bytes] "
+                    "join (VERY SLOW; element=%s len=%d)",
+                    type(first).__name__, len(first),
+                )
+                _CV_BASE_EXTRACTOR_LOGGED = True
+            return b"".join(chunk)
+
+    raise RuntimeError(
+        f"Could not extract bytes from CVPixelBuffer base address "
+        f"(base type={type(base).__name__}, "
+        f"slice type={type(chunk).__name__}, "
+        f"element type={type(chunk[0]).__name__ if chunk else 'empty'})"
+    )
 
 
 if _HAS_SCK:
