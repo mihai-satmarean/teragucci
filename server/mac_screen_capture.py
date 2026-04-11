@@ -127,6 +127,27 @@ def _check_sck_available():
 
 _CV_BASE_EXTRACTOR_LOGGED = False
 
+# ────────────────────────────────────────────────────────────────
+# CoreVideo direct-ctypes fast path
+# ────────────────────────────────────────────────────────────────
+# pyobjc wraps ``CVPixelBufferGetBaseAddress`` as an ``objc.varlist``
+# whose slice decoding is — depending on pyobjc version — either
+# ``list[int]`` or ``list[bytes]`` of one-byte elements. At 3840x2160
+# BGRA that's ~33 million Python allocations per frame, which costs
+# literal seconds on even a fast Mac. We bypass the pyobjc wrapper
+# entirely by dlopen()'ing CoreVideo.framework via ctypes and pulling
+# the raw ``void *`` pointer back, then ``ctypes.string_at`` for a
+# single memcpy into a Python bytes object.
+try:
+    _CV = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreVideo.framework/CoreVideo"
+    )
+    _CV.CVPixelBufferGetBaseAddress.argtypes = [ctypes.c_void_p]
+    _CV.CVPixelBufferGetBaseAddress.restype = ctypes.c_void_p
+    _HAS_CV_CTYPES = True
+except OSError:
+    _HAS_CV_CTYPES = False
+
 
 def _extract_cv_base_bytes(base, length: int) -> bytes:
     """Pull ``length`` bytes out of a CVPixelBuffer base-address return.
@@ -273,22 +294,44 @@ if _HAS_SCK:
                     width = CVPixelBufferGetWidth(pixel_buffer)
                     height = CVPixelBufferGetHeight(pixel_buffer)
                     bpr = CVPixelBufferGetBytesPerRow(pixel_buffer)
-                    base = CVPixelBufferGetBaseAddress(pixel_buffer)
-                    if base is None or width == 0 or height == 0:
+                    if width == 0 or height == 0:
                         return
 
-                    # Pull raw bytes out of the CVPixelBuffer. Recent
-                    # pyobjc (10+) wraps CVPixelBufferGetBaseAddress as
-                    # an ``objc.varlist`` rather than an int-castable
-                    # pointer, so ``int(base)`` blows up. Try several
-                    # extraction paths in order of speed:
-                    #   1. buffer protocol via numpy.frombuffer (fastest)
-                    #   2. __c_void_p__ -> ctypes.string_at
-                    #   3. int(base)   -> ctypes.string_at (old pyobjc)
-                    #   4. slice iteration (slow fallback)
                     total = height * bpr
                     row_stride = width * 4
-                    raw_full = _extract_cv_base_bytes(base, total)
+
+                    # Fast path: call CoreVideo directly via ctypes so
+                    # the base address comes back as a real ``void *``
+                    # we can ``string_at`` in a single memcpy. This is
+                    # 100x+ faster than pyobjc's varlist wrapper which
+                    # materialises every byte as its own Python object.
+                    raw_full = None
+                    global _CV_BASE_EXTRACTOR_LOGGED
+                    if _HAS_CV_CTYPES:
+                        try:
+                            pb_id = objc.pyobjc_id(pixel_buffer)
+                            base_ptr = _CV.CVPixelBufferGetBaseAddress(pb_id)
+                            if base_ptr:
+                                raw_full = ctypes.string_at(base_ptr, total)
+                                if not _CV_BASE_EXTRACTOR_LOGGED:
+                                    logger.info(
+                                        "CVPixelBuffer extraction path: "
+                                        "ctypes CoreVideo memcpy (fast)"
+                                    )
+                                    _CV_BASE_EXTRACTOR_LOGGED = True
+                        except Exception as e:
+                            if not _CV_BASE_EXTRACTOR_LOGGED:
+                                logger.warning(
+                                    "ctypes CoreVideo fast path failed: "
+                                    "%s — falling back to pyobjc varlist",
+                                    e,
+                                )
+
+                    if raw_full is None:
+                        base = CVPixelBufferGetBaseAddress(pixel_buffer)
+                        if base is None:
+                            return
+                        raw_full = _extract_cv_base_bytes(base, total)
 
                     if bpr == row_stride:
                         raw = raw_full
