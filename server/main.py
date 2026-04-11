@@ -165,6 +165,11 @@ class SessionRuntime:
         self.health.current_codec = quality.codec
         self.health.current_chroma = quality.chroma
         self.health.current_resolution = f"{self.capture.width}x{self.capture.height}"
+        # Give the health monitor a reference to the active encoder so
+        # the encode-time stat is pulled live from the encoder's own
+        # rolling average instead of sitting at zero.
+        if self.encoder is not None:
+            self.health.encoder_ref = self.encoder
 
         # Audio
         self.audio: Optional[AudioCapture] = None
@@ -514,12 +519,24 @@ class SessionRuntime:
                                      available_encoders=old_available)
         self.encoder.start(self._on_encoded_frame)
         self.health.current_resolution = f"{self.capture.width}x{self.capture.height}"
+        self.health.encoder_ref = self.encoder
 
     # ── Input handling ───────────────────────────────────────
 
     def handle_input(self, session: "ClientSession", msg: dict):
         msg_type = msg.get("type")
         t0 = time.time()
+        # Only real user-input events count toward the input-latency
+        # metric — housekeeping messages (HEALTH_PONG, CLIENT_HELLO,
+        # QUALITY_SETTINGS, etc.) have nothing to do with input lag and
+        # would dilute the average to near-zero.
+        is_input_event = msg_type in (
+            MsgType.KEY_EVENT,
+            MsgType.MOUSE_MOVE,
+            MsgType.MOUSE_BUTTON,
+            MsgType.MOUSE_SCROLL,
+            MsgType.PEN_EVENT,
+        )
 
         if msg_type == MsgType.KEY_EVENT:
             if isinstance(self.injector, XTestInputInjector):
@@ -585,8 +602,9 @@ class SessionRuntime:
             session.client_screen_height = msg.get("screen_height", 0)
             logger.info("Client screen: %dx%d", session.client_screen_width, session.client_screen_height)
 
-        elapsed_ms = (time.time() - t0) * 1000
-        self.health.record_input_latency(elapsed_ms)
+        if is_input_event:
+            elapsed_ms = (time.time() - t0) * 1000
+            self.health.record_input_latency(elapsed_ms)
 
     # ── Shutdown ─────────────────────────────────────────────
 

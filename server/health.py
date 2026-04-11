@@ -44,6 +44,11 @@ class HealthMonitor:
         self._capture_times: collections.deque = collections.deque(maxlen=120)
         self._input_latencies: collections.deque = collections.deque(maxlen=120)
 
+        # Optional reference to the active VideoEncoder so get_stats()
+        # can pull the encoder's own rolling average without main.py
+        # having to push samples. Set externally after construction.
+        self.encoder_ref = None
+
         # Bandwidth
         self._bytes_sent = 0
         self._bandwidth_window_start = time.time()
@@ -128,6 +133,15 @@ class HealthMonitor:
 
     def get_stats(self) -> HealthStats:
         """Build current health statistics."""
+        # Prefer the encoder's own rolling average if we have a reference.
+        # Note: this is the ffmpeg stdin-pipe write time, which is near-zero
+        # unless ffmpeg is stalling under backpressure — it's a pipeline
+        # health indicator more than a true encode-latency number.
+        if self.encoder_ref is not None:
+            encode_ms = self.encoder_ref.avg_encode_time_ms
+        else:
+            encode_ms = self._avg_deque(self._encode_times)
+
         return HealthStats(
             rtt_ms=round(self.avg_rtt_ms, 1),
             fps_actual=round(self.actual_fps, 1),
@@ -135,9 +149,9 @@ class HealthMonitor:
             bandwidth_mbps=round(self.bandwidth_mbps, 2),
             frames_sent=self._frames_sent,
             frames_dropped=self._frames_dropped,
-            encode_time_ms=round(self._avg_deque(self._encode_times), 1),
-            capture_time_ms=round(self._avg_deque(self._capture_times), 1),
-            input_latency_ms=round(self._avg_deque(self._input_latencies), 1),
+            encode_time_ms=round(encode_ms, 2),
+            capture_time_ms=round(self._avg_deque(self._capture_times), 2),
+            input_latency_ms=round(self._avg_deque(self._input_latencies), 2),
             codec=self.current_codec,
             chroma=self.current_chroma,
             resolution=self.current_resolution,
