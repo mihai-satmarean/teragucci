@@ -75,10 +75,17 @@ class HeadlessClient:
     # ── Public API ────────────────────────────────────────────────
 
     def connect(self, host: str, port: int, username: str, password: str,
-                use_tls: bool = True, timeout: float = 15.0) -> bool:
+                use_tls: bool = True, timeout: float = 15.0,
+                auto_unlock: bool = True,
+                ssh_user: str = "", ssh_key: str = "") -> bool:
         """
         Connect to a Teraguchi server.  Blocks until server_hello is received
         or *timeout* seconds elapse.  Returns True on success.
+
+        auto_unlock: if True (default), automatically runs `loginctl
+        unlock-session` via SSH when a lock screen is detected after connect.
+        ssh_user: SSH username for unlock (defaults to the Teraguchi username).
+        ssh_key: path to SSH private key (default: ~/.ssh/id_ed25519).
         """
         if self._thread and self._thread.is_alive():
             self.disconnect()
@@ -114,7 +121,61 @@ class HeadlessClient:
                     break
             time.sleep(0.1)
 
+        if auto_unlock and self._connected:
+            self._auto_unlock_if_needed(
+                ssh_user=ssh_user or username,
+                ssh_key=ssh_key or "",
+            )
+
         return self._connected
+
+    def _auto_unlock_if_needed(self, ssh_user: str, ssh_key: str = "") -> None:
+        """
+        Detect a GNOME lock screen by checking average frame brightness.
+        A lock screen is mostly dark background (~10-30 average brightness).
+        If detected, SSH in and run `loginctl unlock-session` for all sessions.
+        """
+        import subprocess
+        with self._frame_lock:
+            frame = self._latest_frame
+
+        if frame is None:
+            return
+
+        # Quick brightness check: lock screen = dark purple gradient, avg ~30-60
+        # Desktop with content = much brighter. Threshold: <80 = likely locked.
+        import struct
+        small = frame.resize((64, 40))
+        pixels = list(small.getdata())
+        # pixels can be RGB or RGBA tuples, or ints for grayscale
+        if pixels and isinstance(pixels[0], (tuple, list)):
+            avg = sum(sum(p[:3]) / 3 for p in pixels) / len(pixels)
+        else:
+            avg = sum(pixels) / len(pixels)
+
+        logger.info("Auto-unlock brightness check: avg=%.1f", avg)
+        if avg >= 80:
+            # Bright enough - not a lock screen
+            return
+
+        logger.info("Lock screen detected (avg brightness %.1f) - unlocking via SSH", avg)
+        cmd = ["ssh",
+               "-o", "StrictHostKeyChecking=no",
+               "-o", "BatchMode=yes",
+               "-o", "ConnectTimeout=5"]
+        if ssh_key:
+            cmd += ["-i", ssh_key]
+        cmd += [f"{ssh_user}@{self._host}",
+                "for s in $(loginctl list-sessions --no-legend | awk '{print $1}'); do "
+                "sudo loginctl unlock-session $s 2>/dev/null; done"]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=10)
+            logger.info("loginctl unlock-session: rc=%d", result.returncode)
+            # Give GNOME a moment to dismiss the lock screen
+            time.sleep(2)
+        except Exception as e:
+            logger.warning("Auto-unlock SSH failed: %s", e)
 
     def disconnect(self):
         """Disconnect and stop the background thread."""
