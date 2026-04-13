@@ -359,6 +359,32 @@ class HeadlessClient:
     def move_mouse(self, x: float, y: float):
         self.send_input({"type": MsgType.MOUSE_MOVE, "x": x, "y": y})
 
+    def drag(self, x1: float, y1: float, x2: float, y2: float,
+             steps: int = 20, duration_ms: int = 300, button: int = 1):
+        """Click-and-drag from (x1,y1) to (x2,y2) over duration_ms milliseconds."""
+        btn_map = {1: "left", 2: "middle", 3: "right"}
+        btn_name = btn_map.get(button, "left")
+        step_delay = duration_ms / 1000.0 / max(steps, 1)
+
+        # Press at start
+        self.send_input({"type": MsgType.MOUSE_BUTTON,
+                         "button": btn_name, "pressed": True,
+                         "x": x1, "y": y1})
+        time.sleep(0.05)
+
+        # Move in steps
+        for i in range(1, steps + 1):
+            t = i / steps
+            x = x1 + (x2 - x1) * t
+            y = y1 + (y2 - y1) * t
+            self.send_input({"type": MsgType.MOUSE_MOVE, "x": x, "y": y})
+            time.sleep(step_delay)
+
+        # Release at end
+        self.send_input({"type": MsgType.MOUSE_BUTTON,
+                         "button": btn_name, "pressed": False,
+                         "x": x2, "y": y2})
+
     def scroll(self, x: float, y: float, dx: int = 0, dy: int = -3):
         """Scroll at position. dy<0 = scroll up, dy>0 = scroll down."""
         self.send_input({
