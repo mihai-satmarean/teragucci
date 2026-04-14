@@ -62,9 +62,10 @@ Commercial remote desktop tools cost thousands per seat, lock you into proprieta
 ### Microphone
 - Client microphone streamed to the server in real time (client → server)
 - Captured via `QAudioSource` — PCM s16le, 48 kHz mono, 20 ms chunks
-- Server injects audio into a PulseAudio virtual null-sink (`teraguchi_mic`)
-- Apps on the server (Zoom, Discord, UE5, OBS) can select **Teraguchi Microphone** as their input device
-- Starts automatically on connect, stops on disconnect — no configuration needed
+- Server pipeline: `pacat` → `module-null-sink` (`teraguchi_mic_sink`) → `module-virtual-source` (`teraguchi_mic`)
+- **`teraguchi_mic` appears as a real input device** in GNOME Sound Settings, Zoom, OBS, etc. — not as a monitor source
+- Starts automatically on connect, mute/unmute from quality panel or toolbar
+- Tested on PipeWire 0.3.48 (Ubuntu 22.04)
 
 ### Sessions
 - **PAM mode** — per-user Xvfb/Xorg sessions with GNOME, isolated displays
@@ -79,6 +80,7 @@ Commercial remote desktop tools cost thousands per seat, lock you into proprieta
 - Auto-reconnect with exponential backoff
 - Bookmark panel shows a live **connection status dot** per entry (green = connected, gray = idle)
 - **Disconnect from bookmark panel** — double-click or right-click an active bookmark to disconnect without navigating tabs
+- **Bookmark panel is hidden by default** — press **B** or use View → Bookmarks to toggle; state persists across restarts
 
 ### Health Monitoring
 - Real-time overlay (F9) — RTT, FPS, bandwidth, dropped frames, encode/capture timing
