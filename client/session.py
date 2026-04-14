@@ -261,7 +261,7 @@ class Session(QObject):
         p.on_server_hello = b.server_hello.emit
         p.on_jpeg_frame = lambda ft, x, y, w, h, d: b.jpeg_frame.emit(ft, x, y, w, h, d)
         p.on_video_frame = lambda ft, c, ch, f, t, m, d: b.video_frame.emit(ft, c, ch, f, t & 0x7FFFFFFF, m, d)
-        p.on_audio_frame = lambda c, t, d: b.audio_frame.emit(c, t, d)
+        p.on_audio_frame = lambda c, t, d: b.audio_frame.emit(c, t & 0x7FFFFFFF, d)
         p.on_connected = b.connected.emit
         p.on_disconnected = b.disconnected.emit
         p.on_error = b.error.emit
