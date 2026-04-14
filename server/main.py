@@ -899,7 +899,7 @@ broker_secret: str = ""  # Shared secret for broker token verification
 # HTTP Status Endpoint (for broker health probes)
 # ═══════════════════════════════════════════════════════════════
 
-def handle_http(connection, request):
+async def handle_http(connection, request):
     """
     Handle HTTP requests (non-WebSocket) via process_request hook.
 
