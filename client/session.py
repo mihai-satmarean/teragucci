@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication
 from client.viewer import RemoteViewer
 from client.protocol import ClientProtocol
 from client.audio_player import AudioPlayer
+from client.mic_capture import MicCapture
 from client.video_decoder import DecoderManager
 from client.health_display import HealthOverlay, HealthData
 from client.file_transfer import FileSender
