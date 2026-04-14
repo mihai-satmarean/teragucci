@@ -497,6 +497,17 @@ class SessionManager:
         if xauthority:
             xorg_cmd.extend(["-auth", xauthority])
 
+        # Clean up stale socket (socket without matching lock file means a
+        # previous Xorg died without cleanup — remove it so Xorg can bind).
+        stale_socket = f"/tmp/.X11-unix/X{display_num}"
+        stale_lock = f"/tmp/.X{display_num}-lock"
+        if os.path.exists(stale_socket) and not os.path.exists(stale_lock):
+            logger.warning("Removing stale X socket %s (no lock file)", stale_socket)
+            try:
+                os.remove(stale_socket)
+            except OSError as e:
+                logger.warning("Could not remove stale socket %s: %s", stale_socket, e)
+
         logger.info("Starting Xorg GPU display %s: %s", display, " ".join(xorg_cmd))
 
         try:
@@ -726,6 +737,15 @@ EndSection
         ]
         if xauthority:
             xvfb_cmd.extend(["-auth", xauthority])
+
+        stale_socket = f"/tmp/.X11-unix/X{display_num}"
+        stale_lock = f"/tmp/.X{display_num}-lock"
+        if os.path.exists(stale_socket) and not os.path.exists(stale_lock):
+            logger.warning("Removing stale X socket %s (no lock file)", stale_socket)
+            try:
+                os.remove(stale_socket)
+            except OSError as e:
+                logger.warning("Could not remove stale socket %s: %s", stale_socket, e)
 
         logger.info("Starting Xvfb on %s (software rendering)", display)
         xvfb_proc = subprocess.Popen(
