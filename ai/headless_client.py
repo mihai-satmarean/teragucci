@@ -20,9 +20,9 @@ import websockets
 
 from common.messages import (
     MsgType, ClientHelloMsg,
-    FrameType, VideoCodec,
-    decode_video_header, decode_jpeg_header,
-    VIDEO_HEADER_SIZE, JPEG_HEADER_SIZE,
+    FrameType, VideoCodec, AudioCodec,
+    decode_video_header, decode_jpeg_header, decode_audio_header,
+    VIDEO_HEADER_SIZE, JPEG_HEADER_SIZE, AUDIO_HEADER_SIZE,
     AuthResponse, parse_message,
 )
 
@@ -39,6 +39,7 @@ class HeadlessClient:
     """
 
     FRAME_HISTORY_SIZE = 300   # ~5 min at 1 fps, ~10 s at 30 fps
+    AUDIO_HISTORY_MS   = 30_000  # keep last 30 s of audio in RAM
 
     def __init__(self):
         self._ws = None
@@ -47,7 +48,7 @@ class HeadlessClient:
         self._connected = False
         self._closing = False
 
-        # Frame buffer — latest frame + ring buffer for stream watching
+        # Video buffer — latest frame + ring buffer for stream watching
         self._frame_lock = threading.Lock()
         self._latest_frame = None                          # PIL.Image or None
         # (timestamp_ms: int, PIL.Image) — last FRAME_HISTORY_SIZE frames
@@ -56,6 +57,15 @@ class HeadlessClient:
         )
         self._screen_width = 0
         self._screen_height = 0
+
+        # Audio buffer — raw PCM s16le chunks from server
+        self._audio_lock = threading.Lock()
+        # (timestamp_ms: int, codec: AudioCodec, pcm_bytes: bytes)
+        self._audio_chunks: collections.deque = collections.deque()
+        self._audio_sample_rate = 48_000
+        self._audio_channels = 2
+        self._audio_codec: Optional[AudioCodec] = None
+        self._audio_frame_count = 0
 
         # Video decoder — lazy import so PIL/av failures are clear
         self._decoder_ctx = None
@@ -578,6 +588,12 @@ class HeadlessClient:
             ft, x, y, w, h, payload = decode_jpeg_header(data)
             self._decode_jpeg_frame(payload)
 
+        elif frame_type == FrameType.AUDIO:
+            if len(data) < AUDIO_HEADER_SIZE:
+                return
+            codec, ts, payload = decode_audio_header(data)
+            self._store_audio_chunk(codec, ts, payload)
+
     def _decode_video_frame(self, codec: VideoCodec, payload: bytes):
         """Decode H.264/H.265/AV1 payload into a PIL Image using PyAV."""
         try:
@@ -619,3 +635,95 @@ class HeadlessClient:
         with self._frame_lock:
             self._latest_frame = img
             self._frame_history.append((ts, img))
+
+    def _store_audio_chunk(self, codec: AudioCodec, ts: int, pcm: bytes):
+        """Append a PCM audio chunk to the rolling audio buffer."""
+        with self._audio_lock:
+            self._audio_codec = codec
+            self._audio_frame_count += 1
+            self._audio_chunks.append((ts, codec, pcm))
+            # Trim old chunks: keep only last AUDIO_HISTORY_MS of audio
+            bytes_per_ms = self._audio_sample_rate * self._audio_channels * 2 // 1000
+            max_bytes = bytes_per_ms * self.AUDIO_HISTORY_MS
+            total = sum(len(c) for _, _, c in self._audio_chunks)
+            while self._audio_chunks and total > max_bytes:
+                _, _, old = self._audio_chunks.popleft()
+                total -= len(old)
+
+    # ── Public audio API ──────────────────────────────────────────
+
+    def audio_info(self) -> dict:
+        """Return info about the incoming audio stream."""
+        with self._audio_lock:
+            codec_name = self._audio_codec.name if self._audio_codec else "none"
+            chunk_count = len(self._audio_chunks)
+            total_bytes = sum(len(c) for _, _, c in self._audio_chunks)
+        bytes_per_ms = self._audio_sample_rate * self._audio_channels * 2 // 1000
+        buffered_ms = total_bytes // bytes_per_ms if bytes_per_ms else 0
+        return {
+            "codec": codec_name,
+            "sample_rate": self._audio_sample_rate,
+            "channels": self._audio_channels,
+            "frames_received": self._audio_frame_count,
+            "buffered_chunks": chunk_count,
+            "buffered_ms": buffered_ms,
+            "receiving": self._audio_frame_count > 0,
+        }
+
+    def listen_audio(self, duration_ms: int = 3000) -> Optional[bytes]:
+        """
+        Record audio from the remote session for *duration_ms* milliseconds.
+        Returns WAV-encoded bytes (PCM s16le, 48 kHz, stereo), or None if no
+        audio has been received.
+
+        Waits up to duration_ms + 2000 ms for audio to arrive if the buffer
+        is empty at call time.
+        """
+        # Wait for audio to start arriving if not yet
+        deadline = time.time() + duration_ms / 1000.0 + 2.0
+        with self._audio_lock:
+            already_have = self._audio_frame_count > 0
+
+        if not already_have:
+            while time.time() < deadline:
+                time.sleep(0.1)
+                with self._audio_lock:
+                    if self._audio_frame_count > 0:
+                        break
+
+        # Collect duration_ms worth of new chunks
+        start = time.time()
+        collected: list[bytes] = []
+        end = time.time() + duration_ms / 1000.0
+        last_seen = 0
+
+        while time.time() < end:
+            time.sleep(0.02)
+            with self._audio_lock:
+                new = [(ts, p) for ts, _, p in self._audio_chunks if ts > last_seen]
+            for ts, pcm in new:
+                collected.append(pcm)
+                last_seen = ts
+
+        if not collected:
+            return None
+
+        raw = b"".join(collected)
+        return self._encode_wav(raw)
+
+    def _encode_wav(self, pcm_s16le: bytes) -> bytes:
+        """Wrap raw PCM s16le bytes in a WAV container."""
+        import struct as _struct
+        sr = self._audio_sample_rate
+        ch = self._audio_channels
+        bits = 16
+        byte_rate = sr * ch * bits // 8
+        block_align = ch * bits // 8
+        data_size = len(pcm_s16le)
+        header = _struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF", 36 + data_size, b"WAVE",
+            b"fmt ", 16, 1, ch, sr, byte_rate, block_align, bits,
+            b"data", data_size,
+        )
+        return header + pcm_s16le

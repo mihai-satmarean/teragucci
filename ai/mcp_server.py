@@ -419,6 +419,95 @@ def key(combo: str) -> str:
         return f"Error: {e}"
 
 
+# ── Audio ─────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def audio_info() -> str:
+    """
+    Return information about the remote audio stream.
+
+    Shows codec, sample rate, channels, how many frames have been received,
+    and how many milliseconds of audio are currently buffered.
+
+    Works with teraguchi adapter only (the server streams PCM/Opus audio
+    alongside video). Other adapters return 'not supported'.
+
+    Returns a JSON object:
+        {
+          "codec": "PCM" | "OPUS" | "none",
+          "sample_rate": 48000,
+          "channels": 2,
+          "frames_received": 1234,
+          "buffered_chunks": 150,
+          "buffered_ms": 3000,
+          "receiving": true
+        }
+    """
+    adapter = registry.active
+    if not adapter.connected:
+        return "Error: not connected"
+    if hasattr(adapter, "audio_info"):
+        return json.dumps(adapter.audio_info(), indent=2)
+    return f"Not supported by {adapter.name} adapter (teraguchi only)"
+
+
+@mcp.tool()
+def listen(duration_ms: int = 3000) -> str:
+    """
+    Record audio from the remote desktop session.
+
+    Captures *duration_ms* milliseconds of the server-side audio stream
+    (system audio — whatever is playing on the remote machine) and returns
+    it as a base64-encoded WAV file (PCM s16le, 48 kHz, stereo).
+
+    Works with teraguchi adapter only.
+
+    Args:
+        duration_ms: How long to record in milliseconds (default 3000 = 3s).
+                     Maximum useful value is 30000 (30s) — older audio is
+                     discarded from the ring buffer.
+
+    Returns a JSON object:
+        {"duration_ms": 3000, "wav_b64": "<base64>", "size_bytes": 288044}
+    or an error string.
+
+    To transcribe, pipe the WAV through a local Whisper call:
+        import base64, subprocess, json, tempfile, pathlib
+        r = json.loads(listen(5000))
+        wav = base64.b64decode(r["wav_b64"])
+        tmp = pathlib.Path("/tmp/remote_audio.wav")
+        tmp.write_bytes(wav)
+        subprocess.run(["whisper", str(tmp), "--model", "base"])
+    """
+    adapter = registry.active
+    if not adapter.connected:
+        return "Error: not connected"
+    if not hasattr(adapter, "listen_audio"):
+        return f"Not supported by {adapter.name} adapter (teraguchi only)"
+
+    import base64
+    wav = adapter.listen_audio(duration_ms=duration_ms)
+    if wav is None:
+        info = adapter.audio_info() if hasattr(adapter, "audio_info") else {}
+        received = info.get("frames_received", 0) if isinstance(info, dict) else 0
+        if received == 0:
+            return (
+                "No audio received from server. "
+                "Check that the remote machine has PulseAudio/PipeWire running "
+                "and that the Teraguchi server was started with audio enabled."
+            )
+        return "No audio captured in the requested duration"
+
+    b64 = base64.b64encode(wav).decode()
+    return json.dumps({
+        "duration_ms": duration_ms,
+        "wav_b64": b64,
+        "size_bytes": len(wav),
+        "format": "PCM s16le 48000 Hz stereo WAV",
+    })
+
+
 # ── Extras (teraguchi adapter; degrade gracefully on others) ──────
 
 

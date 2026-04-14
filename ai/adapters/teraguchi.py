@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from typing import ClassVar
+from typing import ClassVar, Optional
 
 from .base import BaseAdapter, Capability
 
@@ -106,6 +106,16 @@ class TeraGuchiAdapter(BaseAdapter):
 
     def press_combo(self, combo: str) -> None:
         self._client.press_combo(combo)
+
+    # ---- audio -----------------------------------------------------------
+
+    def audio_info(self) -> dict:
+        """Return current audio stream info from the server."""
+        return self._client.audio_info()
+
+    def listen_audio(self, duration_ms: int = 3000) -> Optional[bytes]:
+        """Record remote audio for duration_ms. Returns WAV bytes or None."""
+        return self._client.listen_audio(duration_ms=duration_ms)
 
     # ---- extras (exposed through master MCP) ----------------------------
 
