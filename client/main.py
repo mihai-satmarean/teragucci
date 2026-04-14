@@ -29,7 +29,7 @@ sys.path.insert(0, ".")
 from client import theme
 from client import icons
 from client.session import Session
-from client.bookmarks import BookmarkManager
+from client.bookmarks import BookmarkManager, UISettings
 from client.health_display import HealthStatusWidget, HealthData
 from client.quality_control import QualityControlPanel
 from client.fullscreen_toolbar import FullscreenToolbar, REVEAL_ZONE
@@ -616,6 +616,12 @@ class MainWindow(QMainWindow):
         self._bookmark_dock.setWidget(self._bookmark_panel)
         self.addDockWidget(Qt.LeftDockWidgetArea, self._bookmark_dock)
 
+        # Restore persisted visibility; default hidden to save screen space
+        self._ui_settings = UISettings.load()
+        if not self._ui_settings.get("bookmarks_visible", False):
+            self._bookmark_dock.hide()
+        self._bookmark_dock.visibilityChanged.connect(self._on_bookmark_dock_visibility)
+
         self._quality_dock = QDockWidget("  Quality", self)
         self._quality_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self._quality_dock.setFeatures(
@@ -725,6 +731,7 @@ class MainWindow(QMainWindow):
         view_menu = mb.addMenu("&View")
         bm_action = self._bookmark_dock.toggleViewAction()
         bm_action.setIcon(icons.icon_bookmark())
+        bm_action.setShortcut(QKeySequence("B"))
         view_menu.addAction(bm_action)
         qc_action = self._quality_dock.toggleViewAction()
         qc_action.setIcon(icons.icon_settings())
@@ -1114,6 +1121,13 @@ class MainWindow(QMainWindow):
         from client.key_diagnostic import KeyDiagnosticDialog
         diag = KeyDiagnosticDialog(self)
         diag.show()
+
+    def _on_bookmark_dock_visibility(self, visible: bool):
+        """Persist bookmark dock visibility — skip saves during fullscreen transitions."""
+        if self.isFullScreen():
+            return
+        self._ui_settings["bookmarks_visible"] = visible
+        UISettings.save(self._ui_settings)
 
     # ── Fullscreen ───────────────────────────────
 
