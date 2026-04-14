@@ -47,7 +47,7 @@ from common.messages import (
     HealthPing, HealthPong, VideoCodec, ChromaSubsampling,
     VideoFrameFlags, AuthRequest, AuthResult, MonitorListMsg,
     ClipboardMsg, encode_video_header, encode_jpeg_header, encode_audio_header,
-    AudioCodec, parse_message, generate_challenge,
+    AudioCodec, parse_message, generate_challenge, decode_mic_header,
 )
 from common.keymap import qt_key_to_linux_scancode
 from server.platform_backends import (
@@ -60,6 +60,7 @@ from server.platform_backends import (
 from server.cursor_tracker import CursorTracker
 from server.video_encoder import VideoEncoder, JpegFallbackEncoder, check_ffmpeg_available, detect_encoders
 from server.audio_capture import AudioCapture, check_audio_available
+from server.mic_injector import MicInjector
 from server.health import HealthMonitor
 from server.auth import Authenticator
 from server.file_transfer import FileReceiver
@@ -177,6 +178,11 @@ class SessionRuntime:
             self.audio = AudioCapture(bitrate_kbps=quality.audio_bitrate_kbps,
                                       uid=self._uid, gid=self._gid)
 
+        # Microphone injection (client mic → PulseAudio virtual source on server)
+        self.mic_injector: Optional[MicInjector] = None
+        if not no_audio and uid != 0:
+            self.mic_injector = MicInjector(uid=uid, gid=gid)
+
         # Clipboard
         self.clipboard: Optional[ClipboardSync] = None
         if not no_clipboard:
@@ -277,6 +283,9 @@ class SessionRuntime:
 
         if self.audio and self.audio.available and self.quality.enable_audio:
             self.audio.start(self._on_audio_frame)
+
+        if self.mic_injector:
+            self.mic_injector.start()
 
         if self.clipboard and self.clipboard.available:
             self.clipboard.start_monitoring(self._on_clipboard_change)
@@ -619,6 +628,8 @@ class SessionRuntime:
             self.encoder.stop()
         if self.audio:
             self.audio.stop()
+        if self.mic_injector:
+            self.mic_injector.stop()
         if self.clipboard:
             self.clipboard.stop()
         if self.cursor_tracker:
@@ -880,6 +891,14 @@ async def handle_client(websocket: WebSocketServerProtocol):
                     logger.warning("Invalid JSON from %s", addr)
                 except Exception as e:
                     logger.error("Error from %s: %s", addr, e)
+            elif isinstance(message, bytes) and len(message) > 0:
+                frame_type = message[0]
+                if frame_type == FrameType.MIC and runtime.mic_injector:
+                    try:
+                        _, _, pcm = decode_mic_header(message)
+                        runtime.mic_injector.write(pcm)
+                    except Exception as e:
+                        logger.debug("Mic frame error: %s", e)
 
     except asyncio.TimeoutError:
         logger.warning("Client %s: auth timeout", addr)

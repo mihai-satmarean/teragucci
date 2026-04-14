@@ -127,14 +127,33 @@ class MicInjector:
         except Exception:
             return "user"
 
+    def _find_existing_module(self) -> Optional[str]:
+        """Return module index if teraguchi_mic sink already exists."""
+        result = self._pactl("list", "short", "modules")
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            if "module-null-sink" in line and _SINK_NAME in line:
+                return line.split()[0]
+        return None
+
     def _load_null_sink(self):
-        """Create the PulseAudio null sink (idempotent via name check)."""
-        # Remove any stale sink from a previous run
-        self._pactl("unload-module", "module-null-sink")
+        """Create the PulseAudio/PipeWire null sink (idempotent).
+
+        Note: sink_properties with spaces breaks PipeWire-Pulse argument
+        parsing when passed via subprocess list args, so we omit it.
+        We unload only by stored index — never 'unload-module module-null-sink'
+        which would nuke all null-sinks in the system.
+        """
+        existing = self._find_existing_module()
+        if existing:
+            logger.debug("MicInjector: reusing existing null-sink module idx=%s", existing)
+            self._module_idx = existing
+            return
+
         result = self._pactl(
             "load-module", "module-null-sink",
             f"sink_name={_SINK_NAME}",
-            f"sink_properties=device.description=Teraguchi\\ Microphone",
         )
         if result.returncode != 0:
             raise RuntimeError(
