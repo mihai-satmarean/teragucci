@@ -426,6 +426,7 @@ class SessionManager:
 
         # Start PulseAudio for the user (audio capture needs it)
         self._start_pulseaudio(session)
+        self._ensure_audio_sink(session)
 
         # Start window manager (gnome-shell needs D-Bus ready)
         if self._wm_cmd:
@@ -894,6 +895,47 @@ EndSection
             logger.info("PulseAudio started for %s", session.username)
         except Exception as e:
             logger.warning("PulseAudio failed for %s: %s", session.username, e)
+
+    def _ensure_audio_sink(self, session: UserSession):
+        """Load a dedicated system-audio null-sink (teraguchi_audio).
+
+        This gives applications a stable output device and provides
+        teraguchi_audio.monitor for AudioCapture — regardless of whether
+        PipeWire/PulseAudio created auto_null or not.
+        """
+        pa_server = f"unix:/run/user/{session.uid}/pulse/native"
+        env = session.env.copy()
+        env["PULSE_RUNTIME_PATH"] = f"/run/user/{session.uid}/pulse"
+        env["XDG_RUNTIME_DIR"] = f"/run/user/{session.uid}"
+        demote = lambda: self._demote(session.uid, session.gid)
+
+        # Wait briefly for PulseAudio/PipeWire socket to be ready
+        for _ in range(10):
+            if os.path.exists(pa_server.replace("unix:", "")):
+                break
+            time.sleep(0.2)
+
+        try:
+            # Check if already loaded (idempotent)
+            result = subprocess.run(
+                ["pactl", "--server", pa_server, "list", "short", "modules"],
+                capture_output=True, text=True, timeout=5,
+                env=env, preexec_fn=demote)
+            if "teraguchi_audio" in result.stdout:
+                logger.debug("teraguchi_audio sink already present for %s", session.username)
+                return
+
+            subprocess.run(
+                ["pactl", "--server", pa_server,
+                 "load-module", "module-null-sink",
+                 "sink_name=teraguchi_audio",
+                 "sink_properties=device.description=Teraguchi_Audio"],
+                capture_output=True, timeout=5,
+                env=env, preexec_fn=demote)
+            logger.info("Loaded teraguchi_audio null-sink for %s", session.username)
+        except Exception as e:
+            logger.warning("Could not load teraguchi_audio sink for %s: %s",
+                           session.username, e)
 
     def _get_logind_session_id(self, username: str) -> str:
         """Find an existing logind session ID for the user.
