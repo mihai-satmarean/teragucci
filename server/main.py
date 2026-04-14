@@ -60,6 +60,7 @@ from server.platform_backends import (
 from server.cursor_tracker import CursorTracker
 from server.video_encoder import VideoEncoder, JpegFallbackEncoder, check_ffmpeg_available, detect_encoders
 from server.audio_capture import AudioCapture, check_audio_available
+from server.mic_injector import MicInjector
 from server.health import HealthMonitor
 from server.auth import Authenticator
 from server.file_transfer import FileReceiver
@@ -171,11 +172,16 @@ class SessionRuntime:
         if self.encoder is not None:
             self.health.encoder_ref = self.encoder
 
-        # Audio
+        # Audio (server → client playback)
         self.audio: Optional[AudioCapture] = None
         if not no_audio and check_audio_available(uid=self._uid, gid=self._gid):
             self.audio = AudioCapture(bitrate_kbps=quality.audio_bitrate_kbps,
                                       uid=self._uid, gid=self._gid)
+
+        # Microphone injection (client → server)
+        self.mic: Optional[MicInjector] = None
+        if not no_audio and uid > 0:
+            self.mic = MicInjector(uid=self._uid, gid=self._gid)
 
         # Clipboard
         self.clipboard: Optional[ClipboardSync] = None
@@ -606,6 +612,16 @@ class SessionRuntime:
             elapsed_ms = (time.time() - t0) * 1000
             self.health.record_input_latency(elapsed_ms)
 
+    # ── Microphone (client → server) ─────────────────────────
+
+    def handle_mic_frame(self, pcm_data: bytes):
+        """Inject a PCM chunk from the client into the PulseAudio virtual mic."""
+        if self.mic is None:
+            return
+        if not self.mic._started:
+            self.mic.start()
+        self.mic.write(pcm_data)
+
     # ── Shutdown ─────────────────────────────────────────────
 
     def stop(self):
@@ -617,6 +633,8 @@ class SessionRuntime:
             self.encoder.stop()
         if self.audio:
             self.audio.stop()
+        if self.mic:
+            self.mic.stop()
         if self.clipboard:
             self.clipboard.stop()
         if self.cursor_tracker:
@@ -878,6 +896,13 @@ async def handle_client(websocket: WebSocketServerProtocol):
                     logger.warning("Invalid JSON from %s", addr)
                 except Exception as e:
                     logger.error("Error from %s: %s", addr, e)
+            elif isinstance(message, bytes) and message:
+                frame_type = message[0]
+                if frame_type == FrameType.MIC:
+                    from common.messages import decode_mic_header, MIC_HEADER_SIZE
+                    if len(message) > MIC_HEADER_SIZE:
+                        _, _, pcm = decode_mic_header(message)
+                        runtime.handle_mic_frame(pcm)
 
     except asyncio.TimeoutError:
         logger.warning("Client %s: auth timeout", addr)
