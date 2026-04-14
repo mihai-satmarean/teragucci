@@ -1,25 +1,58 @@
 """
-Teraguchi AI MCP Server
+Teraguchi MCP Master Server
 
-Exposes the Teraguchi remote desktop as MCP tools so AI agents (Cursor, Claude)
-can take screenshots, move the mouse, click, type, and press key combinations.
+Exposes remote desktop control as MCP tools. Implements the Daedalus Lab
+adapter-hub pattern: one master server, multiple protocol candidates.
 
-Usage:
-    python -m ai.mcp_server
+Adapters (in priority order):
+  teraguchi  WebSocket + H.264/NVENC + uinput + PAM   [MASTER, default]
+  vnc        VNC/RFB via vncdotool                    [candidate]
+  rdp        RDP via xfreerdp + Xvfb                  [candidate]
+  local      Local display via mss + pynput            [candidate]
+
+Tools exposed:
+  Adapter management:
+    list_adapters()                    show all adapters + capabilities
+    use_adapter(name)                  switch active adapter
+    connect(host, port, user, pass)    connect via active adapter
+    disconnect()
+    connection_status()
+
+  Vision:
+    screenshot()                       base64 PNG, current frame
+    get_screen_size()
+    watch(duration_ms, sample_every_ms)  sample frames over time
+    wait_for_change(timeout_ms, sensitivity)
+    frame_history(count)              ring buffer (teraguchi only)
+
+  Mouse:
+    click(x, y, button)               normalized 0.0-1.0
+    double_click(x, y)
+    move_mouse(x, y)
+    scroll(x, y, direction, amount)
+    drag(x1, y1, x2, y2, steps, duration_ms)
+
+  Keyboard:
+    type_text(text)
+    key(combo)                         "ctrl+c", "alt+F4", "enter" etc.
+
+  Extras (teraguchi adapter only, degrade gracefully on others):
+    clipboard_get()
+    clipboard_set(text)
+    run_remote(command, timeout_sec)
+    find_element(description, action)
 
 Configure in ~/.cursor/mcp.json:
     "teraguchi": {
         "command": "/path/to/.venv-ai/bin/python",
         "args": ["-m", "ai.mcp_server"],
-        "cwd": "/path/to/teragucci"
+        "cwd": "/path/to/teragucci",
+        "env": {
+            "TERAGUCHI_HOST": "192.168.178.94",
+            "TERAGUCHI_USER": "mihai",
+            "TERAGUCHI_PASS": "mihai123"
+        }
     }
-
-Environment variables (optional, for pre-configured connections):
-    TERAGUCHI_HOST      default host (e.g. "192.168.178.94")
-    TERAGUCHI_PORT      default port (default: 4443)
-    TERAGUCHI_USER      default username
-    TERAGUCHI_PASS      default password
-    TERAGUCHI_TLS       "1" to use TLS (default), "0" for plain ws://
 """
 
 import json
@@ -28,192 +61,293 @@ import os
 import sys
 import time
 
-# Add the project root to sys.path so `common/` and `ai/` are importable
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
 from fastmcp import FastMCP
-from ai.headless_client import HeadlessClient
+from ai.adapters import registry
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("teraguchi")
-_client: HeadlessClient = HeadlessClient()
 
 
-# ── Connection tools ──────────────────────────────────────────────
+# ── Adapter management ────────────────────────────────────────────
+
+
+@mcp.tool()
+def list_adapters() -> str:
+    """
+    List all registered remote desktop adapters with their capabilities and status.
+
+    Returns a JSON array describing each adapter. The 'active' field marks
+    the one currently in use. 'connected' shows if it has an open session.
+
+    Adapters in order of capability:
+      teraguchi  - MASTER: H.264/NVENC, uinput, streaming ring buffer, PAM
+      vnc        - candidate: VNC/RFB, polling screenshots
+      rdp        - candidate: RDP via xfreerdp on Linux/macOS
+      local      - candidate: local display control (mss + pynput)
+    """
+    return json.dumps(registry.list(), indent=2)
+
+
+@mcp.tool()
+def use_adapter(name: str) -> str:
+    """
+    Switch to a different remote desktop adapter.
+
+    The active adapter is used by all subsequent tools (screenshot, click, etc.)
+    Switching does NOT disconnect — call disconnect() first if needed.
+
+    Args:
+        name: Adapter name. One of: "teraguchi", "vnc", "rdp", "local"
+
+    Returns the adapter description and its capabilities.
+    """
+    try:
+        adapter = registry.use(name)
+        info = adapter.adapter_info()
+        caps = ", ".join(info["capabilities"])
+        return f"Active adapter: {name}\n{info['description']}\nCapabilities: {caps}"
+    except ValueError as e:
+        return f"Error: {e}"
+
 
 @mcp.tool()
 def connect(
     host: str = "",
-    port: int = 4443,
+    port: int = 0,
     username: str = "",
     password: str = "",
     use_tls: bool = True,
 ) -> str:
     """
-    Connect to a Teraguchi remote desktop server.
+    Connect to a remote desktop using the active adapter.
+
+    For teraguchi (default): WebSocket to port 4443, TLS by default.
+    For vnc: RFB to port 5900. use_tls is ignored.
+    For rdp: RDP to port 3389. use_tls is ignored.
+    For local: no host needed -- controls the local machine.
 
     Args:
-        host:     Server IP or hostname. Falls back to TERAGUCHI_HOST env var.
-        port:     Server port (default 4443).
-        username: Login username. Falls back to TERAGUCHI_USER env var.
-        password: Login password. Falls back to TERAGUCHI_PASS env var.
-        use_tls:  Use wss:// (True, default) or ws:// (False).
+        host:     Remote IP or hostname. Falls back to TERAGUCHI_HOST env var.
+        port:     Port. 0 = adapter default (4443/5900/3389).
+        username: Login user. Falls back to TERAGUCHI_USER env var.
+        password: Password. Falls back to TERAGUCHI_PASS env var.
+        use_tls:  Use TLS (teraguchi only, default True).
 
-    Returns a status message with the detected screen resolution.
+    Returns a status message with screen resolution, or an error.
     """
+    adapter = registry.active
     h = host or os.environ.get("TERAGUCHI_HOST", "")
-    p = port or int(os.environ.get("TERAGUCHI_PORT", "4443"))
     u = username or os.environ.get("TERAGUCHI_USER", "")
     pw = password or os.environ.get("TERAGUCHI_PASS", "")
-    tls_env = os.environ.get("TERAGUCHI_TLS", "1")
-    tls = use_tls if (host or username or password) else (tls_env != "0")
 
-    if not h:
-        return "Error: host is required (pass as argument or set TERAGUCHI_HOST)"
-    if not u:
-        return "Error: username is required (pass as argument or set TERAGUCHI_USER)"
+    defaults = {"teraguchi": 4443, "vnc": 5900, "rdp": 3389, "local": 0}
+    p = port or int(os.environ.get("TERAGUCHI_PORT", str(defaults.get(adapter.name, 4443))))
 
-    if _client.connected:
-        _client.disconnect()
+    if adapter.name == "local":
+        h = h or "localhost"
+        u = u or ""
+        pw = pw or ""
+    else:
+        if not h:
+            return "Error: host is required (pass as argument or set TERAGUCHI_HOST)"
+        if not u and adapter.name in ("teraguchi", "rdp"):
+            return "Error: username is required (pass as argument or set TERAGUCHI_USER)"
+
+    if adapter.connected:
+        adapter.disconnect()
 
     try:
-        _client.connect(h, p, u, pw, use_tls=tls, timeout=20.0)
-    except ConnectionError as e:
-        return f"Connection failed: {e}"
+        kwargs = {"use_tls": use_tls} if adapter.name == "teraguchi" else {}
+        adapter.connect(h, p, u, pw, **kwargs)
+    except Exception as e:
+        return f"Connection failed ({adapter.name}): {e}"
 
-    w, h_res = _client.screen_size
-    return f"Connected to {h}:{p} — screen {w}x{h_res}"
+    w, h_res = adapter.screen_size
+    return f"Connected via {adapter.name} to {h}:{p} -- screen {w}x{h_res}"
 
 
 @mcp.tool()
 def disconnect() -> str:
-    """Disconnect from the Teraguchi server."""
-    if not _client.connected:
-        return "Not connected"
-    _client.disconnect()
-    return "Disconnected"
+    """Disconnect the active adapter from its current session."""
+    adapter = registry.active
+    if not adapter.connected:
+        return f"Not connected (adapter: {adapter.name})"
+    adapter.disconnect()
+    return f"Disconnected ({adapter.name})"
 
 
 @mcp.tool()
 def connection_status() -> str:
-    """Return current connection status and screen resolution."""
-    if not _client.connected:
-        return "Not connected"
-    w, h = _client.screen_size
-    return f"Connected — screen {w}x{h}"
+    """Return current connection status, active adapter, and screen resolution."""
+    adapter = registry.active
+    if not adapter.connected:
+        return f"Not connected (adapter: {adapter.name})"
+    w, h = adapter.screen_size
+    return f"Connected via {adapter.name} -- screen {w}x{h}"
 
 
-# ── Vision tools ──────────────────────────────────────────────────
+# ── Vision ────────────────────────────────────────────────────────
+
 
 @mcp.tool()
 def screenshot() -> str:
     """
-    Capture the current remote desktop screen.
+    Capture the current remote desktop screen as a base64-encoded PNG.
 
-    Returns a base64-encoded PNG image of the full screen, or an error string
-    if not connected or no frame has been received yet.
-
-    After connecting, call this tool a couple of seconds later to ensure
-    the first frame has been decoded.
+    Waits up to 5 seconds for the first frame if just connected.
+    Returns an error string if not connected or no frame received.
     """
-    if not _client.connected:
-        return "Error: not connected — call connect() first"
+    adapter = registry.active
+    if not adapter.connected:
+        return f"Error: not connected -- call connect() first"
 
-    # Wait up to 5 seconds for the first frame
     for _ in range(50):
-        data = _client.screenshot()
+        data = adapter.screenshot()
         if data:
             return data
         time.sleep(0.1)
 
-    return "Error: no frame received yet — server may still be starting the session"
+    return "Error: no frame received yet -- server may still be starting the session"
 
 
 @mcp.tool()
 def get_screen_size() -> dict:
     """Return the remote screen resolution as {width, height}."""
-    if not _client.connected:
+    adapter = registry.active
+    if not adapter.connected:
         return {"error": "not connected"}
-    w, h = _client.screen_size
+    w, h = adapter.screen_size
     return {"width": w, "height": h}
 
 
-# ── Mouse tools ───────────────────────────────────────────────────
-
 @mcp.tool()
-def click(
-    x: float,
-    y: float,
-    button: str = "left",
-) -> str:
+def watch(duration_ms: int = 2000, sample_every_ms: int = 500) -> str:
     """
-    Click at a position on the remote screen.
+    Observe the remote screen over time and return a sequence of frames.
+
+    Result: JSON array of {ts: unix_ms, frame: base64_png}.
+    Use to watch animations, verify UI transitions, or track changes.
 
     Args:
-        x:      Horizontal position, normalized 0.0 (left) to 1.0 (right).
-        y:      Vertical position, normalized 0.0 (top) to 1.0 (bottom).
-        button: Which mouse button: "left" (default), "right", "middle".
+        duration_ms:     Observation window in ms (default 2000).
+        sample_every_ms: Interval between frames (default 500ms = 2fps).
+                         Set to 100 for ~10fps, 33 for ~30fps.
 
-    Returns "ok" or an error string.
+    For the teraguchi adapter this reads directly from the ring buffer
+    (zero overhead). Other adapters use polling (each sample = 1 screenshot).
     """
-    if not _client.connected:
+    adapter = registry.active
+    if not adapter.connected:
+        return "Error: not connected"
+    frames = adapter.watch_frames(duration_ms=duration_ms, sample_every_ms=sample_every_ms)
+    return json.dumps([{"ts": ts, "frame": b64} for ts, b64 in frames])
+
+
+@mcp.tool()
+def wait_for_change(timeout_ms: int = 10_000, sensitivity: float = 0.02) -> str:
+    """
+    Block until the screen changes, then return the new frame.
+
+    More efficient than polling screenshot() in a loop.
+
+    Args:
+        timeout_ms:  Max wait in ms (default 10000).
+        sensitivity: Fraction of pixels that must change (0.0-1.0):
+                     0.005 -- cursor blink / clock tick
+                     0.02  -- button click feedback, small popup (default)
+                     0.05  -- window open/close
+                     0.20  -- full scene change, new app launched
+
+    Returns JSON: {ts, diff, frame} or timeout error.
+    """
+    adapter = registry.active
+    if not adapter.connected:
+        return "Error: not connected"
+    result = adapter.wait_for_change(timeout_ms=timeout_ms, sensitivity=sensitivity)
+    if result is None:
+        return f"Timeout: no change detected in {timeout_ms}ms (sensitivity={sensitivity})"
+    ts, b64, diff = result
+    return json.dumps({"ts": ts, "diff": round(diff, 4), "frame": b64})
+
+
+@mcp.tool()
+def frame_history(count: int = 5) -> str:
+    """
+    Return the last N frames from the live ring buffer (teraguchi adapter only).
+
+    Ring buffer holds up to 300 frames. Other adapters return 1 current frame.
+
+    Args:
+        count: Number of most recent frames (default 5, max 300).
+
+    Returns JSON array: [{ts, frame}, ...].
+    """
+    adapter = registry.active
+    if not adapter.connected:
+        return "Error: not connected"
+    frames = adapter.latest_frame_history(count=min(count, 300))
+    return json.dumps([{"ts": ts, "frame": b64} for ts, b64 in frames])
+
+
+# ── Mouse ─────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def click(x: float, y: float, button: str = "left") -> str:
+    """
+    Click at a normalized position on the remote screen.
+
+    Args:
+        x:      Horizontal 0.0 (left) to 1.0 (right).
+        y:      Vertical 0.0 (top) to 1.0 (bottom).
+        button: "left" (default), "right", "middle".
+    """
+    adapter = registry.active
+    if not adapter.connected:
         return "Error: not connected"
     btn = {"left": 1, "middle": 2, "right": 3}.get(button.lower(), 1)
-    _client.click(x, y, button=btn)
+    adapter.click(x, y, button=btn)
     return "ok"
 
 
 @mcp.tool()
 def double_click(x: float, y: float) -> str:
-    """
-    Double-click at a normalized position on the remote screen.
-
-    Args:
-        x: Horizontal position 0.0–1.0.
-        y: Vertical position 0.0–1.0.
-    """
-    if not _client.connected:
+    """Double-click at a normalized position (0.0-1.0)."""
+    adapter = registry.active
+    if not adapter.connected:
         return "Error: not connected"
-    _client.click(x, y, button=1, double=True)
+    adapter.click(x, y, button=1, double=True)
     return "ok"
 
 
 @mcp.tool()
 def move_mouse(x: float, y: float) -> str:
-    """
-    Move the mouse cursor to a normalized position without clicking.
-
-    Args:
-        x: Horizontal position 0.0–1.0.
-        y: Vertical position 0.0–1.0.
-    """
-    if not _client.connected:
+    """Move mouse to normalized position without clicking."""
+    adapter = registry.active
+    if not adapter.connected:
         return "Error: not connected"
-    _client.move_mouse(x, y)
+    adapter.move_mouse(x, y)
     return "ok"
 
 
 @mcp.tool()
-def scroll(
-    x: float,
-    y: float,
-    direction: str = "down",
-    amount: int = 3,
-) -> str:
+def scroll(x: float, y: float, direction: str = "down", amount: int = 3) -> str:
     """
-    Scroll the mouse wheel at a given position.
+    Scroll at a normalized position.
 
     Args:
-        x:         Horizontal position 0.0–1.0.
-        y:         Vertical position 0.0–1.0.
-        direction: "up", "down", "left", or "right".
-        amount:    Number of scroll steps (default 3).
+        x, y:      Position 0.0-1.0.
+        direction: "up", "down", "left", "right".
+        amount:    Scroll steps (default 3).
     """
-    if not _client.connected:
+    adapter = registry.active
+    if not adapter.connected:
         return "Error: not connected"
     dx, dy = 0, 0
     if direction == "up":
@@ -224,272 +358,150 @@ def scroll(
         dx = -amount
     elif direction == "right":
         dx = amount
-    _client.scroll(x, y, dx=dx, dy=dy)
+    adapter.scroll(x, y, dx=dx, dy=dy)
     return "ok"
 
 
-# ── Keyboard tools ────────────────────────────────────────────────
+@mcp.tool()
+def drag(x1: float, y1: float, x2: float, y2: float,
+         steps: int = 20, duration_ms: int = 300) -> str:
+    """
+    Click-drag from (x1,y1) to (x2,y2), both normalized 0.0-1.0.
+
+    Args:
+        steps:       Mouse-move steps for smoothness (default 20).
+        duration_ms: Total drag time in ms (default 300).
+    """
+    adapter = registry.active
+    if not adapter.connected:
+        return "Error: not connected"
+    adapter.drag(x1, y1, x2, y2, steps=steps, duration_ms=duration_ms)
+    return f"ok -- dragged ({x1},{y1}) -> ({x2},{y2})"
+
+
+# ── Keyboard ──────────────────────────────────────────────────────
+
 
 @mcp.tool()
 def type_text(text: str) -> str:
     """
-    Type a string of text on the remote desktop, character by character.
+    Type a string of text on the remote desktop.
 
-    Supports printable ASCII, newline (\\n), and tab (\\t).
-    For special keys or combinations use the key() tool instead.
-
-    Args:
-        text: The text to type.
+    Supports printable ASCII, newline (\\n), tab (\\t).
+    For special keys or combos use key() instead.
     """
-    if not _client.connected:
+    adapter = registry.active
+    if not adapter.connected:
         return "Error: not connected"
-    _client.type_text(text)
-    return f"ok — typed {len(text)} characters"
+    adapter.type_text(text)
+    return f"ok -- typed {len(text)} characters"
 
 
 @mcp.tool()
 def key(combo: str) -> str:
     """
-    Press a key or key combination on the remote desktop.
+    Press a key or key combination.
 
-    Modifier keys are joined with '+'. Examples:
+    Examples:
         "enter", "escape", "tab", "backspace", "delete"
         "ctrl+c", "ctrl+v", "ctrl+z", "ctrl+a"
         "ctrl+shift+t", "alt+F4"
         "F1" through "F12"
-        "left", "right", "up", "down"
-        "home", "end", "pageup", "pagedown"
-
-    Args:
-        combo: Key combination string (case-insensitive).
+        "left", "right", "up", "down", "home", "end", "pageup", "pagedown"
     """
-    if not _client.connected:
+    adapter = registry.active
+    if not adapter.connected:
         return "Error: not connected"
     try:
-        _client.press_combo(combo)
-        return f"ok — pressed {combo!r}"
+        adapter.press_combo(combo)
+        return f"ok -- pressed {combo!r}"
     except ValueError as e:
         return f"Error: {e}"
 
 
-# ── Stream watching tools ─────────────────────────────────────────
+# ── Extras (teraguchi adapter; degrade gracefully on others) ──────
 
-@mcp.tool()
-def watch(
-    duration_ms: int = 2000,
-    sample_every_ms: int = 500,
-) -> str:
-    """
-    Observe the remote screen for a period of time and return a sequence of frames.
-
-    The result is a JSON array of objects:
-        [{"ts": <unix_ms>, "frame": "<base64_png>"}, ...]
-
-    Use this to understand what is happening on screen over time — for example
-    to watch a video, track an animation, or verify that a UI transition completed.
-
-    Args:
-        duration_ms:     How long to observe, in milliseconds (default 2000 = 2s).
-        sample_every_ms: Interval between captured frames (default 500ms = 2 fps).
-                         Set to 100 for ~10 fps, or 33 for ~30 fps.
-                         Warning: many frames at high fps = large response.
-
-    Returns a JSON string (array).
-    """
-    if not _client.connected:
-        return "Error: not connected"
-
-    frames = _client.watch_frames(duration_ms=duration_ms, sample_every_ms=sample_every_ms)
-    result = [{"ts": ts, "frame": b64} for ts, b64 in frames]
-    return json.dumps(result)
-
-
-@mcp.tool()
-def wait_for_change(
-    timeout_ms: int = 10_000,
-    sensitivity: float = 0.02,
-) -> str:
-    """
-    Block until something on the remote screen changes, then return the new frame.
-
-    This is more efficient than polling screenshot() in a loop.
-    The server watches the decoded frame stream internally and returns as soon
-    as the pixel difference exceeds the sensitivity threshold.
-
-    Args:
-        timeout_ms:  Maximum time to wait in milliseconds (default 10 000 = 10s).
-        sensitivity: Fraction of screen pixels that must change to trigger
-                     (0.0–1.0, default 0.02 = 2%).
-                     0.005 — cursor blink, clock update, subtle animations
-                     0.02  — UI element appears, button click feedback
-                     0.05  — window open/close, significant layout change
-                     0.20  — full scene change, new application launched
-
-    Returns a JSON object: {"ts": <unix_ms>, "diff": <0.0–1.0>, "frame": "<base64_png>"}
-    or a timeout error string.
-    """
-    if not _client.connected:
-        return "Error: not connected"
-
-    result = _client.wait_for_change(timeout_ms=timeout_ms, sensitivity=sensitivity)
-    if result is None:
-        return f"Timeout: no change detected within {timeout_ms}ms (sensitivity={sensitivity})"
-
-    ts, b64, diff = result
-    return json.dumps({"ts": ts, "diff": round(diff, 4), "frame": b64})
-
-
-@mcp.tool()
-def frame_history(count: int = 5) -> str:
-    """
-    Return the last N frames from the live frame ring buffer.
-
-    The ring buffer holds up to 300 frames. This lets you inspect what
-    happened recently without needing to capture in real time.
-
-    Args:
-        count: Number of most recent frames to return (default 5, max 300).
-
-    Returns a JSON array: [{"ts": <unix_ms>, "frame": "<base64_png>"}, ...]
-    """
-    if not _client.connected:
-        return "Error: not connected"
-
-    frames = _client.latest_frame_history(count=min(count, 300))
-    result = [{"ts": ts, "frame": b64} for ts, b64 in frames]
-    return json.dumps(result)
-
-
-# ── Drag ─────────────────────────────────────────────────────────
-
-@mcp.tool()
-def drag(x1: float, y1: float, x2: float, y2: float, steps: int = 20, duration_ms: int = 300) -> str:
-    """
-    Click-and-drag from (x1, y1) to (x2, y2) on the remote desktop.
-
-    Coordinates are in pixels (absolute, matching the remote screen resolution).
-    Use get_screen_size() to know the resolution.
-
-    Args:
-        x1, y1:     Start position in pixels.
-        x2, y2:     End position in pixels.
-        steps:      Number of intermediate mouse-move steps (default 20, smoother = more steps).
-        duration_ms: Total drag duration in milliseconds (default 300ms).
-    """
-    if not _client.connected:
-        return "Error: not connected"
-    _client.drag(x1, y1, x2, y2, steps=steps, duration_ms=duration_ms)
-    return f"ok — dragged ({x1},{y1}) -> ({x2},{y2})"
-
-
-# ── Clipboard ────────────────────────────────────────────────────
 
 @mcp.tool()
 def clipboard_get() -> str:
     """
-    Return the current text content of the remote desktop clipboard.
+    Return the remote clipboard text content.
 
-    Uses xclip on the remote machine. Returns the clipboard text or an error.
+    Works with teraguchi adapter (via SSH + xclip).
+    Other adapters return 'not supported'.
     """
-    if not _client.connected:
+    adapter = registry.active
+    if not adapter.connected:
         return "Error: not connected"
-    import subprocess
-    result = subprocess.run(
-        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-         "-o", "ConnectTimeout=5",
-         f"{_client._username}@{_client._host}",
-         "DISPLAY=:10 xclip -selection clipboard -o 2>/dev/null || "
-         "DISPLAY=:10 xsel --clipboard --output 2>/dev/null || echo ''"],
-        capture_output=True, text=True, timeout=8,
-    )
-    return result.stdout.strip() or "(clipboard is empty)"
+    if hasattr(adapter, "clipboard_get"):
+        return adapter.clipboard_get()
+    return f"Not supported by {adapter.name} adapter"
 
 
 @mcp.tool()
 def clipboard_set(text: str) -> str:
     """
-    Set the remote desktop clipboard to the given text.
+    Set the remote clipboard to the given text.
 
-    Uses xclip on the remote machine, so it can be pasted with Ctrl+V.
+    Works with teraguchi adapter (via SSH + xclip).
+    Other adapters return 'not supported'.
 
     Args:
-        text: Text to place on the clipboard.
+        text: Text to put on the clipboard.
     """
-    if not _client.connected:
+    adapter = registry.active
+    if not adapter.connected:
         return "Error: not connected"
-    import subprocess
-    result = subprocess.run(
-        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-         "-o", "ConnectTimeout=5",
-         f"{_client._username}@{_client._host}",
-         f"echo {repr(text)} | DISPLAY=:10 xclip -selection clipboard 2>/dev/null || "
-         f"echo {repr(text)} | DISPLAY=:10 xsel --clipboard --input 2>/dev/null && echo ok"],
-        capture_output=True, text=True, timeout=8,
-    )
-    return "ok" if result.returncode == 0 else f"Error: {result.stderr.strip()}"
+    if hasattr(adapter, "clipboard_set"):
+        return adapter.clipboard_set(text)
+    return f"Not supported by {adapter.name} adapter"
 
-
-# ── Remote command execution ──────────────────────────────────────
 
 @mcp.tool()
 def run_remote(command: str, timeout_sec: int = 30) -> str:
     """
-    Run a shell command on the remote machine via SSH and return its output.
+    Run a shell command on the remote machine via SSH and return output.
 
-    The command runs as the connected user. Use for:
-    - Checking logs: run_remote("tail -50 /tmp/ue_proj.log")
-    - Checking processes: run_remote("ps aux | grep UnrealEditor")
-    - Checking GPU: run_remote("nvidia-smi")
-    - File operations: run_remote("ls ~/Projects/")
-    - Anything you would normally do in a separate SSH terminal.
+    Works with teraguchi adapter only (SSH passthrough).
+    Examples:
+      run_remote("nvidia-smi")
+      run_remote("ps aux | grep UnrealEditor")
+      run_remote("tail -50 /tmp/ue.log")
 
     Args:
-        command:     Shell command to execute.
-        timeout_sec: Maximum seconds to wait (default 30).
+        command:     Shell command string.
+        timeout_sec: Max wait in seconds (default 30).
     """
-    if not _client.connected:
+    adapter = registry.active
+    if not adapter.connected:
         return "Error: not connected"
-    import subprocess
-    result = subprocess.run(
-        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-         "-o", "ConnectTimeout=5",
-         f"{_client._username}@{_client._host}",
-         command],
-        capture_output=True, text=True, timeout=timeout_sec,
-    )
-    output = result.stdout
-    if result.stderr:
-        output += "\n[stderr]\n" + result.stderr
-    return output.strip() or "(no output)"
+    if hasattr(adapter, "run_remote"):
+        return adapter.run_remote(command, timeout_sec=timeout_sec)
+    return f"Not supported by {adapter.name} adapter (requires SSH)"
 
-
-# ── UI element finder (AT-SPI accessibility tree) ─────────────────
 
 @mcp.tool()
 def find_element(description: str, action: str = "click") -> str:
     """
-    Find a UI element by name/label using the Linux AT-SPI accessibility tree
-    and optionally perform an action on it.
+    Find a UI element by name using the Linux AT-SPI accessibility tree.
 
-    This works for GNOME, GTK, and some Qt applications that expose
-    accessibility information. Much more reliable than coordinate-based clicks
-    because it works regardless of where the window is positioned on screen.
+    Works with teraguchi adapter (SSH + pyatspi on remote machine).
+    More reliable than coordinate clicks: works regardless of window position.
 
     Args:
-        description: Text to search for — button label, menu item, input field name, etc.
-                     Case-insensitive substring match.
-        action:      What to do with the found element: "click" (default), "info" (just return position).
-
-    Returns a JSON object with element info and action result, or an error message.
+        description: Text to match -- button label, menu item, field name.
+                     Case-insensitive substring.
+        action:      "click" (default) or "info" (return position only).
     """
-    if not _client.connected:
+    adapter = registry.active
+    if not adapter.connected:
         return "Error: not connected"
 
-    import subprocess, json as _json
+    if not hasattr(adapter, "run_remote"):
+        return f"Not supported by {adapter.name} adapter (requires SSH + pyatspi)"
 
     script = f"""
 import pyatspi, json, sys
-
 query = {repr(description.lower())}
 results = []
 
@@ -514,28 +526,23 @@ def scan(node, depth=0):
 desktop = pyatspi.Registry.getDesktop(0)
 for app in desktop:
     scan(app)
-
 print(json.dumps(results[:10]))
 """
 
-    result = subprocess.run(
-        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-         "-o", "ConnectTimeout=5",
-         f"{_client._username}@{_client._host}",
-         f"DISPLAY=:10 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus python3 -c {repr(script)}"],
-        capture_output=True, text=True, timeout=15,
+    import json as _json
+    raw = adapter.run_remote(
+        f"DISPLAY=:10 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
+        f"python3 -c {repr(script)}",
+        timeout_sec=15,
     )
 
-    if result.returncode != 0:
-        return f"AT-SPI error: {result.stderr.strip()}"
-
     try:
-        elements = _json.loads(result.stdout.strip())
+        elements = _json.loads(raw.strip())
     except Exception:
-        return f"Parse error: {result.stdout[:200]}"
+        return f"Parse error: {raw[:200]}"
 
     if not elements:
-        return f"No element found matching {description!r} in accessibility tree"
+        return f"No element found matching {description!r}"
 
     best = elements[0]
     info = f"Found: {best['role']} {best['name']!r} at ({best['x']}, {best['y']})"
@@ -543,16 +550,17 @@ print(json.dumps(results[:10]))
     if action == "click" and best["x"] >= 0:
         cx = best["x"] + best.get("w", 10) // 2
         cy = best["y"] + best.get("h", 10) // 2
-        _client.click(cx, cy)
-        return f"ok — {info} — clicked at ({cx}, {cy})"
+        w, h = adapter.screen_size
+        adapter.click(cx / w, cy / h)
+        return f"ok -- {info} -- clicked at ({cx}, {cy})"
 
-    return f"ok — {info} — {_json.dumps(elements)}"
+    return f"ok -- {info} -- {_json.dumps(elements)}"
 
 
 # ── Entry point ───────────────────────────────────────────────────
 
+
 def main():
-    # Pre-connect if all env vars are set
     host = os.environ.get("TERAGUCHI_HOST", "")
     user = os.environ.get("TERAGUCHI_USER", "")
     pw   = os.environ.get("TERAGUCHI_PASS", "")
@@ -561,11 +569,12 @@ def main():
 
     if host and user and pw:
         try:
-            _client.connect(host, port, user, pw, use_tls=tls, timeout=15.0)
-            w, h = _client.screen_size
-            logger.warning("Pre-connected to %s:%d — %dx%d", host, port, w, h)
+            adapter = registry.active  # teraguchi by default
+            adapter.connect(host, port, user, pw, use_tls=tls, timeout=15.0)
+            w, h = adapter.screen_size
+            logger.warning("Pre-connected via %s to %s:%d -- %dx%d", adapter.name, host, port, w, h)
         except Exception as e:
-            logger.warning("Pre-connect failed: %s — use connect() tool", e)
+            logger.warning("Pre-connect failed: %s -- use connect() tool", e)
 
     mcp.run()
 
