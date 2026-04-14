@@ -257,6 +257,10 @@ class BrokerMachinePicker(QDialog):
 class BookmarkDelegate(QStyledItemDelegate):
     """Custom delegate for bookmark items — card-style with server icon."""
 
+    def __init__(self, parent=None, active_ids=None):
+        super().__init__(parent)
+        self._active_ids = active_ids if active_ids is not None else set()
+
     def sizeHint(self, option, index):
         return QSize(option.rect.width(), 56)
 
@@ -289,7 +293,7 @@ class BookmarkDelegate(QStyledItemDelegate):
         name_font.setWeight(QFont.DemiBold)
         name_font.setPointSize(12)
         painter.setFont(name_font)
-        painter.drawText(rect.adjusted(36, 6, -8, -22), Qt.AlignLeft | Qt.AlignVCenter, name)
+        painter.drawText(rect.adjusted(36, 6, -42, -22), Qt.AlignLeft | Qt.AlignVCenter, name)
 
         # Host:port (secondary)
         host_text = index.data(Qt.UserRole + 2) or ""
@@ -297,17 +301,31 @@ class BookmarkDelegate(QStyledItemDelegate):
         sub_font = QFont()
         sub_font.setPointSize(10)
         painter.setFont(sub_font)
-        painter.drawText(rect.adjusted(36, 24, -8, -2), Qt.AlignLeft | Qt.AlignVCenter, host_text)
+        painter.drawText(rect.adjusted(36, 24, -42, -2), Qt.AlignLeft | Qt.AlignVCenter, host_text)
+
+        # Connection status dot (right side)
+        bid = index.data(Qt.UserRole)
+        is_active = bid in self._active_ids
+        dot_color = QColor(theme.SUCCESS) if is_active else QColor(theme.TEXT_MUTED)
+        dot_color.setAlpha(200 if is_active else 80)
+        painter.setBrush(dot_color)
+        painter.setPen(Qt.NoPen)
+        dot_size = 8
+        dot_x = rect.right() - dot_size - 8
+        dot_y = rect.center().y() - dot_size // 2
+        painter.drawEllipse(dot_x, dot_y, dot_size, dot_size)
 
         painter.restore()
 
 
 class BookmarkPanel(QWidget):
     connect_requested = Signal(str)
+    disconnect_requested = Signal(str)
 
     def __init__(self, bookmark_mgr: BookmarkManager, parent=None):
         super().__init__(parent)
         self._mgr = bookmark_mgr
+        self._active_ids: set = set()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
@@ -322,7 +340,7 @@ class BookmarkPanel(QWidget):
         layout.addLayout(search_row)
 
         self._list = QListWidget()
-        self._list.setItemDelegate(BookmarkDelegate(self._list))
+        self._list.setItemDelegate(BookmarkDelegate(self._list, self._active_ids))
         self._list.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._show_context_menu)
         self._list.doubleClicked.connect(self._on_double_click)
@@ -382,8 +400,13 @@ class BookmarkPanel(QWidget):
 
     def _on_double_click(self, _index):
         item = self._list.currentItem()
-        if item:
-            self.connect_requested.emit(item.data(Qt.UserRole))
+        if not item:
+            return
+        bid = item.data(Qt.UserRole)
+        if bid in self._active_ids:
+            self.disconnect_requested.emit(bid)
+        else:
+            self.connect_requested.emit(bid)
 
     def _show_context_menu(self, pos):
         item = self._list.itemAt(pos)
@@ -391,8 +414,12 @@ class BookmarkPanel(QWidget):
             return
         bid = item.data(Qt.UserRole)
         menu = QMenu(self)
-        menu.addAction(icons.icon_connect(), "Connect",
-                       lambda: self.connect_requested.emit(bid))
+        if bid in self._active_ids:
+            menu.addAction(icons.icon_disconnect(), "Disconnect",
+                           lambda: self.disconnect_requested.emit(bid))
+        else:
+            menu.addAction(icons.icon_connect(), "Connect",
+                           lambda: self.connect_requested.emit(bid))
         menu.addAction(icons.icon_edit(), "Edit",
                        lambda: self._edit_bookmark(bid))
         menu.addSeparator()
@@ -451,6 +478,12 @@ class BookmarkPanel(QWidget):
         path, _ = QFileDialog.getSaveFileName(self, "Export", "bookmarks.json", "JSON (*.json)")
         if path:
             self._mgr.export_bookmarks(path, include_passwords=False)
+
+    def set_active_bookmarks(self, ids: set):
+        """Update the set of bookmark IDs that currently have an active session."""
+        self._active_ids.clear()
+        self._active_ids.update(ids)
+        self._list.viewport().update()
 
 
 # ════════════════════════════════════════════════════
@@ -579,6 +612,7 @@ class MainWindow(QMainWindow):
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable)
         self._bookmark_panel = BookmarkPanel(self._bookmarks)
         self._bookmark_panel.connect_requested.connect(self._connect_bookmark)
+        self._bookmark_panel.disconnect_requested.connect(self._disconnect_by_bookmark_id)
         self._bookmark_dock.setWidget(self._bookmark_panel)
         self.addDockWidget(Qt.LeftDockWidgetArea, self._bookmark_dock)
 
@@ -826,6 +860,8 @@ class MainWindow(QMainWindow):
             self._status_label.setText("No connections")
             self._health_status.data = HealthData()
 
+        self._bookmark_panel.set_active_bookmarks(self._active_bookmark_ids())
+
     def _on_tab_changed(self, idx):
         session = self._sessions.get(idx)
         if session:
@@ -855,6 +891,8 @@ class MainWindow(QMainWindow):
                 self._status_label.setText(f"Disconnected: {session.display_name}")
             elif status == "connecting":
                 self._status_label.setText(f"Connecting: {session.display_name}")
+
+        self._bookmark_panel.set_active_bookmarks(self._active_bookmark_ids())
 
     # ── Actions ──────────────────────────────────
 
@@ -902,6 +940,23 @@ class MainWindow(QMainWindow):
             profile.host, profile.port, profile.username, password,
             use_tls=profile.use_tls, auto_reconnect=profile.auto_connect,
             bookmark_id=bookmark_id, mode=mode)
+
+    def _active_bookmark_ids(self) -> set:
+        """Return the set of bookmark IDs that currently have a connected session."""
+        return {
+            s._bookmark_id
+            for s in self._sessions.values()
+            if s._bookmark_id and s.is_connected
+        }
+
+    def _disconnect_by_bookmark_id(self, bookmark_id: str):
+        """Disconnect the session associated with a specific bookmark ID."""
+        for idx, session in list(self._sessions.items()):
+            if session._bookmark_id == bookmark_id:
+                if self.isFullScreen():
+                    self._toggle_fullscreen()
+                self._close_tab(idx)
+                return
 
     def _disconnect_active(self):
         """Disconnect the active session and close its tab.
