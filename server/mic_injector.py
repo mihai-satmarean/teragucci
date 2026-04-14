@@ -1,24 +1,29 @@
 """
-Microphone injection into PulseAudio for Teraguchi server.
-
-Receives raw PCM s16le audio from the client and injects it into a virtual
-PulseAudio null sink.  Apps running on the server can then select
-"teraguchi_mic.monitor" as their microphone source.
+Microphone injection into PipeWire/PulseAudio for Teraguchi server.
 
 Architecture
 ------------
   Client PCM  →  WebSocket binary (MIC frame)
-              →  server/main.py handle_mic_frame()
+              →  server/main.py (binary message handler)
               →  MicInjector.write(pcm)
-              →  pacat stdin → PA null-sink "teraguchi_mic"
-              →  Apps see "teraguchi_mic.monitor" as a mic source
+              →  writer thread → pacat stdin
+              →  null-sink  "teraguchi_mic_sink"
+              →  null-sink monitor → module-virtual-source
+              →  "teraguchi_mic"  ← apps see this as a real microphone
 
-The null-sink approach is chosen over module-pipe-source because pacat
-handles all backpressure and format negotiation automatically.
+Why virtual-source on top of null-sink
+---------------------------------------
+GNOME Settings (and most desktop apps) only show proper Source devices,
+not monitor sources.  module-virtual-source wraps the null-sink monitor
+and presents it as a first-class Source that appears in GNOME Sound
+Settings, Zoom, OBS, etc.
+
+Tested on PipeWire 0.3.48 (Ubuntu 22.04).
 """
 
 import logging
 import os
+import pwd
 import queue
 import subprocess
 import threading
@@ -26,26 +31,31 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_SINK_NAME = "teraguchi_mic"
+_SINK_NAME   = "teraguchi_mic_sink"    # internal null-sink (pacat target)
+_SOURCE_NAME = "teraguchi_mic"         # virtual-source visible in GNOME
 _SAMPLE_RATE = 48_000
-_CHANNELS = 1
-_FORMAT = "s16le"
+_CHANNELS    = 1
+_FORMAT      = "s16le"
 
 
 class MicInjector:
     """
-    Feeds client microphone PCM into a PulseAudio virtual null sink.
+    Feeds client microphone PCM into a PipeWire virtual microphone source.
 
-    Start/stop are idempotent.  write() is thread-safe and non-blocking
-    (frames are dropped rather than blocked when the queue is full).
+    Creates two PA modules:
+      1. module-null-sink  (teraguchi_mic_sink)  — pacat plays into this
+      2. module-virtual-source (teraguchi_mic)   — wraps the monitor,
+         visible as a real mic in GNOME Settings and all PulseAudio apps
+
+    start/stop are idempotent.  write() is thread-safe and non-blocking.
     """
 
     def __init__(self, uid: int, gid: int, pa_socket: Optional[str] = None):
         self._uid = uid
         self._gid = gid
-        # PulseAudio socket path for the user's session
         self._pa_server = pa_socket or f"unix:/run/user/{uid}/pulse/native"
-        self._module_idx: Optional[str] = None
+        self._sink_module_idx: Optional[str] = None
+        self._source_module_idx: Optional[str] = None
         self._pacat: Optional[subprocess.Popen] = None
         self._queue: queue.Queue = queue.Queue(maxsize=20)
         self._thread: Optional[threading.Thread] = None
@@ -54,17 +64,19 @@ class MicInjector:
     # ── Lifecycle ────────────────────────────────
 
     def start(self) -> bool:
-        """Load the PA null sink and start pacat.  Returns True on success."""
+        """Create PA modules and start pacat.  Returns True on success."""
         if self._started:
             return True
         try:
-            self._load_null_sink()
+            self._load_sink()
+            self._load_virtual_source()
             self._start_pacat()
             self._thread = threading.Thread(
                 target=self._writer_loop, name="mic-injector", daemon=True)
             self._thread.start()
             self._started = True
-            logger.info("MicInjector: virtual mic '%s' ready (uid=%d)", _SINK_NAME, self._uid)
+            logger.info("MicInjector: virtual mic '%s' ready (uid=%d)",
+                        _SOURCE_NAME, self._uid)
             return True
         except Exception as exc:
             logger.warning("MicInjector: startup failed: %s", exc)
@@ -75,7 +87,6 @@ class MicInjector:
         if not self._started:
             return
         self._started = False
-        # Unblock writer thread
         try:
             self._queue.put_nowait(None)
         except queue.Full:
@@ -99,83 +110,90 @@ class MicInjector:
 
     # ── Internal ─────────────────────────────────
 
-    def _pactl(self, *args, timeout: int = 5) -> subprocess.CompletedProcess:
-        env = {
+    def _pa_env(self) -> dict:
+        return {
             **os.environ,
-            "XDG_RUNTIME_DIR": f"/run/user/{self._uid}",
+            "XDG_RUNTIME_DIR":   f"/run/user/{self._uid}",
             "PULSE_RUNTIME_PATH": f"/run/user/{self._uid}/pulse",
-            "HOME": f"/home/{self._get_username()}",
+            "HOME": f"/home/{self._username()}",
         }
-        uid, gid = self._uid, self._gid
 
-        def _drop():
-            os.setgid(gid)
-            os.setuid(uid)
+    def _drop_privs(self):
+        """preexec_fn: drop root to session user."""
+        os.setgid(self._gid)
+        os.setuid(self._uid)
 
+    def _pactl(self, *args, timeout: int = 5) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["pactl", "--server", self._pa_server, *args],
             capture_output=True, text=True,
             timeout=timeout,
-            env=env,
-            preexec_fn=_drop,
+            env=self._pa_env(),
+            preexec_fn=self._drop_privs,
         )
 
-    def _get_username(self) -> str:
+    def _username(self) -> str:
         try:
-            import pwd
             return pwd.getpwuid(self._uid).pw_name
         except Exception:
             return "user"
 
-    def _find_existing_module(self) -> Optional[str]:
-        """Return module index if teraguchi_mic sink already exists."""
+    def _find_module(self, module_type: str, name: str) -> Optional[str]:
+        """Return module index if a module with the given name is loaded."""
         result = self._pactl("list", "short", "modules")
         if result.returncode != 0:
             return None
         for line in result.stdout.splitlines():
-            if "module-null-sink" in line and _SINK_NAME in line:
+            if module_type in line and name in line:
                 return line.split()[0]
         return None
 
-    def _load_null_sink(self):
-        """Create the PulseAudio/PipeWire null sink (idempotent).
-
-        Note: sink_properties with spaces breaks PipeWire-Pulse argument
-        parsing when passed via subprocess list args, so we omit it.
-        We unload only by stored index — never 'unload-module module-null-sink'
-        which would nuke all null-sinks in the system.
-        """
-        existing = self._find_existing_module()
+    def _load_sink(self):
+        """Load module-null-sink as the pacat target (idempotent)."""
+        existing = self._find_module("module-null-sink", _SINK_NAME)
         if existing:
-            logger.debug("MicInjector: reusing existing null-sink module idx=%s", existing)
-            self._module_idx = existing
+            logger.debug("MicInjector: reusing null-sink idx=%s", existing)
+            self._sink_module_idx = existing
             return
 
         result = self._pactl(
             "load-module", "module-null-sink",
             f"sink_name={_SINK_NAME}",
+            f"rate={_SAMPLE_RATE}",
+            f"channels={_CHANNELS}",
         )
         if result.returncode != 0:
             raise RuntimeError(
-                f"pactl load-module module-null-sink failed: {result.stderr.strip()}"
-            )
-        self._module_idx = result.stdout.strip()
-        logger.debug("MicInjector: null-sink module idx=%s", self._module_idx)
+                f"load module-null-sink failed: {result.stderr.strip()}")
+        self._sink_module_idx = result.stdout.strip()
+        logger.debug("MicInjector: null-sink idx=%s", self._sink_module_idx)
+
+    def _load_virtual_source(self):
+        """Load module-virtual-source wrapping the null-sink monitor.
+
+        This is what GNOME Sound Settings and desktop apps see as a
+        proper microphone — unlike a raw monitor source which is hidden.
+        """
+        existing = self._find_module("module-virtual-source", _SOURCE_NAME)
+        if existing:
+            logger.debug("MicInjector: reusing virtual-source idx=%s", existing)
+            self._source_module_idx = existing
+            return
+
+        result = self._pactl(
+            "load-module", "module-virtual-source",
+            f"source_name={_SOURCE_NAME}",
+            f"master={_SINK_NAME}.monitor",
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"load module-virtual-source failed: {result.stderr.strip()}")
+        self._source_module_idx = result.stdout.strip()
+        logger.debug("MicInjector: virtual-source idx=%s",
+                     self._source_module_idx)
 
     def _start_pacat(self):
-        """Start pacat to feed PCM from stdin into the null sink."""
-        uid, gid = self._uid, self._gid
-        env = {
-            **os.environ,
-            "XDG_RUNTIME_DIR": f"/run/user/{uid}",
-            "PULSE_RUNTIME_PATH": f"/run/user/{uid}/pulse",
-            "HOME": f"/home/{self._get_username()}",
-        }
-
-        def _drop():
-            os.setgid(gid)
-            os.setuid(uid)
-
+        """Start pacat writing PCM from stdin into the null-sink."""
         self._pacat = subprocess.Popen(
             [
                 "pacat", "--playback",
@@ -190,13 +208,13 @@ class MicInjector:
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            env=env,
-            preexec_fn=_drop,
+            env=self._pa_env(),
+            preexec_fn=self._drop_privs,
         )
         logger.debug("MicInjector: pacat pid=%d", self._pacat.pid)
 
     def _writer_loop(self):
-        """Drain the queue and write chunks to pacat stdin."""
+        """Drain the queue and write PCM chunks to pacat stdin."""
         while self._started:
             try:
                 chunk = self._queue.get(timeout=0.5)
@@ -205,7 +223,7 @@ class MicInjector:
             if chunk is None:
                 break
             if not self._pacat or self._pacat.poll() is not None:
-                logger.warning("MicInjector: pacat exited — stopping injection")
+                logger.warning("MicInjector: pacat exited — stopping")
                 break
             try:
                 self._pacat.stdin.write(chunk)
@@ -225,9 +243,11 @@ class MicInjector:
                 pass
             self._pacat = None
 
-        if self._module_idx:
-            try:
-                self._pactl("unload-module", self._module_idx)
-            except Exception:
-                pass
-            self._module_idx = None
+        for idx_attr in ("_source_module_idx", "_sink_module_idx"):
+            idx = getattr(self, idx_attr, None)
+            if idx:
+                try:
+                    self._pactl("unload-module", idx)
+                except Exception:
+                    pass
+                setattr(self, idx_attr, None)
