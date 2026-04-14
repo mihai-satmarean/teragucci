@@ -381,7 +381,7 @@ class Session(QObject):
 
     def _on_mic_frame(self, pcm_data: bytes):
         """Send a raw PCM mic chunk to the server as a binary MIC frame."""
-        ts = int(time.time() * 1000)
+        ts = int(time.time() * 1000) & 0xFFFFFFFF  # mask to uint32 for struct pack
         header = encode_mic_header(AudioCodec.PCM, ts)
         self.protocol.send_binary(header + pcm_data)
 
