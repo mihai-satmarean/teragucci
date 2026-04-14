@@ -71,10 +71,10 @@ class MicInjector:
             self._load_sink()
             self._load_virtual_source()
             self._start_pacat()
+            self._started = True  # must be set before thread reads it
             self._thread = threading.Thread(
                 target=self._writer_loop, name="mic-injector", daemon=True)
             self._thread.start()
-            self._started = True
             logger.info("MicInjector: virtual mic '%s' ready (uid=%d)",
                         _SOURCE_NAME, self._uid)
             return True
