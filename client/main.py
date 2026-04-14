@@ -588,6 +588,7 @@ class MainWindow(QMainWindow):
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable)
         self._quality_panel = QualityControlPanel()
         self._quality_panel.settings_changed.connect(self._on_quality_changed)
+        self._quality_panel.mic_mute_toggled.connect(self._toggle_mic)
         self._quality_dock.setWidget(self._quality_panel)
         self.addDockWidget(Qt.RightDockWidgetArea, self._quality_dock)
         self._quality_dock.hide()
@@ -946,6 +947,7 @@ class MainWindow(QMainWindow):
     def _on_mic_state_changed(self, active: bool):
         """Update all mic UI when the session mic state changes."""
         s = self._active_session
+        available = s.mic_available if s else False
         device = s.mic_device_name if s else ""
         # Main toolbar action
         self._mic_action.setChecked(not active)
@@ -962,6 +964,8 @@ class MainWindow(QMainWindow):
         # Fullscreen toolbar
         if hasattr(self, "_fs_toolbar"):
             self._fs_toolbar.update_mic_state(active, device)
+        # Quality panel
+        self._quality_panel.update_mic_status(available, not active, device)
 
     def _disconnect_active(self):
         """Disconnect the active session and close its tab.

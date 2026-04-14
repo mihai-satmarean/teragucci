@@ -25,7 +25,7 @@ from client.file_transfer import FileSender
 from client.usb_forward import USBForwardClient
 from common.messages import (
     MsgType, FrameType, QualitySettings, VideoCodec,
-    HealthPong, parse_message,
+    HealthPong, parse_message, encode_mic_header, AudioCodec,
 )
 
 logger = logging.getLogger(__name__)
@@ -378,6 +378,12 @@ class Session(QObject):
     def _on_audio_frame(self, codec, ts, data):
         if self.audio and self.audio.available:
             self.audio.feed(codec, ts, data)
+
+    def _on_mic_frame(self, pcm_data: bytes):
+        """Send a raw PCM mic chunk to the server as a binary MIC frame."""
+        ts = int(time.time() * 1000)
+        header = encode_mic_header(AudioCodec.PCM, ts)
+        self.protocol.send_binary(header + pcm_data)
 
     def _on_connected(self):
         self.status_changed.emit("connected")
