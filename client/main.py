@@ -257,9 +257,14 @@ class BrokerMachinePicker(QDialog):
 class BookmarkDelegate(QStyledItemDelegate):
     """Custom delegate for bookmark items — card-style with server icon."""
 
-    def __init__(self, parent=None, active_ids=None):
+    # How wide the power icon hit-area is (pixels from the right edge of the card)
+    POWER_ZONE_WIDTH = 32
+
+    def __init__(self, parent=None, active_ids=None, power_ids=None):
         super().__init__(parent)
         self._active_ids = active_ids if active_ids is not None else set()
+        # Set of bookmark IDs that have power management configured
+        self._power_ids: set = power_ids if power_ids is not None else set()
 
     def sizeHint(self, option, index):
         return QSize(option.rect.width(), 56)
@@ -315,17 +320,30 @@ class BookmarkDelegate(QStyledItemDelegate):
         dot_y = rect.center().y() - dot_size // 2
         painter.drawEllipse(dot_x, dot_y, dot_size, dot_size)
 
+        # Power icon (shown when bookmark has power management configured)
+        if bid in self._power_ids:
+            power_icon = icons.icon_power(theme.TEXT_MUTED)
+            # Place it to the left of the status dot
+            px = dot_x - 22 - 4
+            py = rect.center().y() - 10
+            hover = bool(option.state & QStyle.State_MouseOver)
+            if hover:
+                power_icon = icons.icon_power(theme.WARNING)
+            power_icon.paint(painter, px, py, 20, 20)
+
         painter.restore()
 
 
 class BookmarkPanel(QWidget):
     connect_requested = Signal(str)
     disconnect_requested = Signal(str)
+    power_action_requested = Signal(str, str)   # (bookmark_id, action)
 
     def __init__(self, bookmark_mgr: BookmarkManager, parent=None):
         super().__init__(parent)
         self._mgr = bookmark_mgr
         self._active_ids: set = set()
+        self._power_ids: set = set()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
@@ -340,11 +358,14 @@ class BookmarkPanel(QWidget):
         layout.addLayout(search_row)
 
         self._list = QListWidget()
-        self._list.setItemDelegate(BookmarkDelegate(self._list, self._active_ids))
+        self._list.setItemDelegate(
+            BookmarkDelegate(self._list, self._active_ids, self._power_ids))
         self._list.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._show_context_menu)
         self._list.doubleClicked.connect(self._on_double_click)
         self._list.setMouseTracking(True)
+        self._list.viewport().setMouseTracking(True)
+        self._list.viewport().installEventFilter(self)
         self._list.setSpacing(1)
         self._list.setStyleSheet(
             f"QListWidget {{ background: {theme.BG_SECONDARY}; border: none; }}"
@@ -383,8 +404,27 @@ class BookmarkPanel(QWidget):
 
         self._refresh()
 
+    def eventFilter(self, obj, event):
+        """Detect left-click on the power icon zone inside a bookmark row."""
+        from PySide6.QtCore import QEvent
+        if obj is self._list.viewport() and event.type() == QEvent.MouseButtonPress:
+            from PySide6.QtCore import Qt as _Qt
+            if event.button() == _Qt.LeftButton:
+                item = self._list.itemAt(event.pos())
+                if item:
+                    rect = self._list.visualItemRect(item)
+                    # Power zone: left edge = rect.right() - dot(16) - icon(20) - gap(4) - margin(8)
+                    power_zone_left = rect.right() - 16 - 24 - 8
+                    if event.pos().x() >= power_zone_left:
+                        bid = item.data(Qt.UserRole)
+                        if bid in self._power_ids:
+                            self._show_power_menu(bid, event.globalPosition().toPoint())
+                            return True
+        return super().eventFilter(obj, event)
+
     def _refresh(self, _query: str = ""):
         self._list.clear()
+        self._power_ids.clear()
         query = self._search.text().strip()
         items = self._mgr.search(query) if query else self._mgr.list_all()
         for bid, profile in items:
@@ -397,6 +437,9 @@ class BookmarkPanel(QWidget):
             item.setData(Qt.UserRole + 2, host_text)
             item.setSizeHint(QSize(0, 56))
             self._list.addItem(item)
+            # Track which bookmarks have power management configured
+            if getattr(profile, "power_backend", "").strip().lower() not in ("", "none"):
+                self._power_ids.add(bid)
 
     def _on_double_click(self, _index):
         item = self._list.currentItem()
@@ -420,12 +463,33 @@ class BookmarkPanel(QWidget):
         else:
             menu.addAction(icons.icon_connect(), "Connect",
                            lambda: self.connect_requested.emit(bid))
+        # Power submenu (only when backend is configured)
+        if bid in self._power_ids:
+            menu.addSeparator()
+            power_menu = menu.addMenu(icons.icon_power(), "Power")
+            power_menu.addAction("Power On  (WoL)",
+                                 lambda: self.power_action_requested.emit(bid, "power_on"))
+            power_menu.addAction("Power Off",
+                                 lambda: self.power_action_requested.emit(bid, "power_off"))
+            power_menu.addAction("Reboot",
+                                 lambda: self.power_action_requested.emit(bid, "reboot"))
+        menu.addSeparator()
         menu.addAction(icons.icon_edit(), "Edit",
                        lambda: self._edit_bookmark(bid))
-        menu.addSeparator()
         menu.addAction(icons.icon_trash(), "Delete",
                        lambda: self._delete_bookmark(bid))
         menu.exec(self._list.mapToGlobal(pos))
+
+    def _show_power_menu(self, bid: str, global_pos):
+        """Pop-up shown when user left-clicks the power icon inside a row."""
+        menu = QMenu(self)
+        menu.addAction(icons.icon_power(theme.SUCCESS), "Power On  (WoL)",
+                       lambda: self.power_action_requested.emit(bid, "power_on"))
+        menu.addAction(icons.icon_power(theme.WARNING), "Power Off",
+                       lambda: self.power_action_requested.emit(bid, "power_off"))
+        menu.addAction(icons.icon_refresh(), "Reboot",
+                       lambda: self.power_action_requested.emit(bid, "reboot"))
+        menu.exec(global_pos)
 
     def _add_bookmark(self):
         dialog = ConnectionDialog(self)
@@ -483,6 +547,14 @@ class BookmarkPanel(QWidget):
         """Update the set of bookmark IDs that currently have an active session."""
         self._active_ids.clear()
         self._active_ids.update(ids)
+        self._list.viewport().update()
+
+    def refresh_power_ids(self):
+        """Recompute which bookmarks have power management configured."""
+        self._power_ids.clear()
+        for bid, profile in self._mgr.list_all():
+            if getattr(profile, "power_backend", "").strip().lower() not in ("", "none"):
+                self._power_ids.add(bid)
         self._list.viewport().update()
 
 
@@ -613,6 +685,7 @@ class MainWindow(QMainWindow):
         self._bookmark_panel = BookmarkPanel(self._bookmarks)
         self._bookmark_panel.connect_requested.connect(self._connect_bookmark)
         self._bookmark_panel.disconnect_requested.connect(self._disconnect_by_bookmark_id)
+        self._bookmark_panel.power_action_requested.connect(self._on_power_action)
         self._bookmark_dock.setWidget(self._bookmark_panel)
         self.addDockWidget(Qt.LeftDockWidgetArea, self._bookmark_dock)
 
@@ -986,6 +1059,46 @@ class MainWindow(QMainWindow):
                     self._toggle_fullscreen()
                 self._close_tab(idx)
                 return
+
+    def _on_power_action(self, bookmark_id: str, action: str):
+        """Handle a power action request from the bookmark panel."""
+        from client.power_manager import PowerManager, POWER_OFF, REBOOT, POWER_ON
+
+        profile = self._bookmarks.get(bookmark_id)
+        if not profile:
+            return
+
+        # Confirm destructive actions
+        if action in (POWER_OFF, REBOOT):
+            label = "Power off" if action == POWER_OFF else "Reboot"
+            answer = QMessageBox.question(
+                self, f"Confirm {label}",
+                f"{label} <b>{profile.name}</b> ({profile.host})?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        # Find the active session for this bookmark (for teraguchi in-band)
+        def _get_session():
+            for s in self._sessions.values():
+                if s._bookmark_id == bookmark_id and s.is_connected:
+                    return s
+            return None
+
+        pm = PowerManager(profile, _get_session)
+
+        if action == POWER_ON:
+            result = pm.power_on()
+        elif action == POWER_OFF:
+            result = pm.power_off()
+        elif action == REBOOT:
+            result = pm.reboot()
+        else:
+            result = f"Unknown power action: {action!r}"
+
+        self.statusBar().showMessage(result, 6000)
 
     def _toggle_mic(self):
         """Mute or unmute the microphone on the active session."""
