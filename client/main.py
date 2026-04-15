@@ -290,19 +290,21 @@ class BookmarkDelegate(QStyledItemDelegate):
         hover = bool(option.state & QStyle.State_MouseOver)
         has_power = bid in self._power_ids
 
-        # Left icon: server icon normally; on hover morph into power icon
+        # Left icon: server icon normally; on hover morph into ⏻ power character
         ix = rect.x() + 8
         iy = rect.center().y() - 10
         if hover:
+            pwr_font = QFont()
+            pwr_font.setPointSize(13)
+            painter.setFont(pwr_font)
             if has_power:
-                icons.icon_power(theme.WARNING).paint(painter, ix, iy, 20, 20)
+                painter.setPen(QColor(theme.WARNING))
             else:
-                # Faint power icon — click opens Power Settings
                 painter.setOpacity(0.35)
-                icons.icon_power(theme.TEXT_MUTED).paint(painter, ix, iy, 20, 20)
-                painter.setOpacity(1.0)
+                painter.setPen(QColor(theme.TEXT_MUTED))
+            painter.drawText(ix, iy, 20, 20, Qt.AlignCenter, "\u23fb")
+            painter.setOpacity(1.0)
         else:
-            # Normal state: server icon, with small power badge dot if configured
             icons.icon_server(theme.TEXT_SECONDARY).paint(painter, ix, iy, 20, 20)
             if has_power:
                 # Small orange dot badge on bottom-right of server icon
