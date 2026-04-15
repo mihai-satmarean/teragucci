@@ -356,7 +356,7 @@ class RemoteViewer(QWidget):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#0a0a10"))  # BG_PRIMARY
 
-        if self._conn_state != "connected" or self._screen_image is None:
+        if self._screen_image is None:
             self._draw_connection_overlay(painter)
             painter.end()
             return
