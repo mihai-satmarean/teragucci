@@ -84,6 +84,13 @@ Commercial remote desktop tools cost thousands per seat, lock you into proprieta
 - **Branded disconnect overlay** — when a session disconnects or is connecting, the viewer shows a branded "teraguchi" overlay with status and hostname instead of freezing the last video frame
 - **Power management** — each bookmark can configure a power backend (SSH, Wake-on-LAN, teraguchi in-band); a power icon appears per row and right-click exposes Power On / Power Off / Reboot (see [Power Management](#power-management))
 
+### AI Agent Control
+- Full MCP (Model Context Protocol) server — works with Cursor, Claude, and any MCP-compatible agent
+- Tools: screenshot, click, drag, type, key combos, run_remote (SSH), clipboard, audio capture
+- **Daedalus Lab adapter-hub** pattern — pluggable backends (teraguchi, VNC, RDP, local)
+- On-demand connect: server stays alive, connects at first tool call using env var credentials
+- See [AI Agent Control (MCP)](#ai-agent-control-mcp) for setup and tool reference
+
 ### Health Monitoring
 - Real-time overlay (F9) — RTT, FPS, bandwidth, dropped frames, encode/capture timing
 - Status bar with color-coded connection quality indicator
@@ -525,6 +532,86 @@ Teraguchi uses a hybrid WebSocket protocol:
 | Linux Server | **Yes** | Yes | Yes | Yes |
 | macOS Client | **Yes** | Yes | Yes | No |
 | Windows Client | **Yes** | Yes | Yes | Yes |
+
+## AI Agent Control (MCP)
+
+Teraguchi ships an MCP (Model Context Protocol) server that exposes the remote desktop as tools for AI agents (Cursor, Claude, etc.). This uses the **Daedalus Lab adapter-hub** pattern: one MCP master server with pluggable transport adapters (teraguchi WebSocket, VNC, RDP, local).
+
+### Setup
+
+Install the AI extras:
+
+```bash
+cd /path/to/teragucci
+uv pip install -e ".[ai]" --python .venv-ai/bin/python
+```
+
+Add to `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "teraguchi": {
+      "command": "/path/to/teragucci/.venv-ai/bin/python",
+      "args": ["-m", "ai.mcp_server"],
+      "cwd": "/path/to/teragucci",
+      "env": {
+        "PYTHONPATH": "/path/to/teragucci",
+        "TERAGUCHI_HOST": "192.168.1.100",
+        "TERAGUCHI_PORT": "4443",
+        "TERAGUCHI_USER": "mihai",
+        "TERAGUCHI_PASS": "yourpassword",
+        "TERAGUCHI_TLS":  "1"
+      }
+    }
+  }
+}
+```
+
+### Available tools
+
+| Tool | Description |
+|---|---|
+| `screenshot()` | Capture screen as base64 PNG |
+| `click(x, y, button)` | Click at normalized position (0.0–1.0) |
+| `double_click(x, y)` | Double-click |
+| `move_mouse(x, y)` | Move without clicking |
+| `scroll(x, y, direction, amount)` | Scroll |
+| `drag(x1, y1, x2, y2)` | Click-drag |
+| `type_text(text)` | Type string |
+| `key(combo)` | Key / combo: `"ctrl+c"`, `"F5"`, `"enter"` |
+| `watch(duration_ms)` | Sample frames over time |
+| `wait_for_change(timeout_ms)` | Block until screen changes |
+| `frame_history(count)` | Last N decoded frames |
+| `run_remote(command)` | Run shell command via SSH, get output |
+| `clipboard_get()` / `clipboard_set(text)` | Remote clipboard |
+| `audio_info()` / `listen(duration_ms)` | Remote audio info / WAV capture |
+| `connect(host, port, user, pass)` | Explicit connect |
+| `disconnect()` | Disconnect |
+| `connection_status()` | Current adapter + resolution |
+| `list_adapters()` / `use_adapter(name)` | Adapter management |
+
+### On-demand connect
+
+The MCP server does **not** pre-connect on startup (pre-connecting caused a SIGABRT crash on macOS Apple Silicon — PyAV's ffmpeg x86_64 binary calls `abort()` from C when decoding incomplete H.264 frames under Rosetta 2). Instead, the first tool call triggers a lazy connect using the env var credentials. Subsequent calls reuse the open session.
+
+> **Platform note:** The MCP server Python binary must be the same architecture as PyAV. On Apple Silicon Macs, use an arm64 Python with an arm64 PyAV build to avoid the Rosetta 2 crash. x86_64 venvs work but require `TERAGUCHI_DISABLE_PYAV=1` (falls back to JPEG-only screenshots).
+
+### ai/ module layout
+
+```
+ai/
+├── mcp_server.py       FastMCP entry point; all @mcp.tool() definitions
+├── headless_client.py  WebSocket client + PyAV decoder (no Qt dep)
+├── keymap.py           Qt key → Linux key code mapping
+└── adapters/
+    ├── registry.py     Adapter registry + active adapter state
+    ├── base.py         BaseAdapter interface
+    ├── teraguchi.py    WebSocket + H.264 + uinput (default)
+    ├── vnc.py          VNC/RFB via vncdotool
+    ├── rdp.py          RDP via xfreerdp + Xvfb
+    └── local.py        Local display via mss + pynput
+```
 
 ## License
 
