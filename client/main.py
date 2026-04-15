@@ -339,12 +339,17 @@ class BookmarkDelegate(QStyledItemDelegate):
 
 
 class PowerSettingsDialog(QDialog):
-    """Edit power management settings for one bookmark."""
+    """Edit power management settings for one bookmark.
+
+    Credentials (host, username) are inherited from the bookmark's connection
+    profile and are not editable here — they are shown read-only as a preview.
+    The only SSH-specific override is the private key path (optional).
+    """
 
     def __init__(self, parent=None, profile=None):
         super().__init__(parent)
         self.setWindowTitle("Power Settings")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(440)
 
         layout = QFormLayout(self)
         layout.setSpacing(10)
@@ -352,51 +357,55 @@ class PowerSettingsDialog(QDialog):
         layout.setLabelAlignment(Qt.AlignRight)
 
         p = profile
+        conn_host = getattr(p, "host", "") or "?"
+        conn_user = getattr(p, "username", "") or "?"
 
         # Backend
         self.backend = QComboBox()
         self.backend.addItem("Disabled", "")
-        self.backend.addItem("SSH  (off/reboot via SSH; WoL for power-on)", "ssh")
-        self.backend.addItem("teraguchi  (in-band; falls back to SSH)", "teraguchi")
+        self.backend.addItem("teraguchi  (in-band; no extra config)", "teraguchi")
+        self.backend.addItem("SSH  (off/reboot via SSH)", "ssh")
         self.backend.addItem("WoL only  (power-on only)", "wol")
         cur = getattr(p, "power_backend", "") or ""
-        idx = {v: i for i, (_, v) in enumerate(
-            [("", ""), ("ssh", "ssh"), ("teraguchi", "teraguchi"), ("wol", "wol")]
-        )}.get(cur, 0)
-        self.backend.setCurrentIndex(idx)
+        backend_order = {"": 0, "teraguchi": 1, "ssh": 2, "wol": 3}
+        self.backend.setCurrentIndex(backend_order.get(cur, 0))
         layout.addRow("Backend:", self.backend)
 
-        # OS
+        # OS (relevant for SSH and teraguchi fallback)
         self.os_combo = QComboBox()
         self.os_combo.addItem("Linux", "linux")
         self.os_combo.addItem("Windows", "windows")
         os_val = getattr(p, "power_os", "linux") or "linux"
         self.os_combo.setCurrentIndex(0 if os_val == "linux" else 1)
-        layout.addRow("Remote OS:", self.os_combo)
+        self._os_label = QLabel("Remote OS:")
+        layout.addRow(self._os_label, self.os_combo)
 
-        layout.addRow(self._separator("SSH (for Power Off / Reboot)"))
+        # SSH section — connection target inherited from bookmark (read-only)
+        self._ssh_sep = self._separator("SSH — Power Off / Reboot")
+        layout.addRow(self._ssh_sep)
 
-        self.ssh_host = QLineEdit(getattr(p, "power_ssh_host", "") or "")
-        self.ssh_host.setPlaceholderText("leave empty to use bookmark host")
-        layout.addRow("SSH Host:", self.ssh_host)
+        # Read-only preview: inherited connection info
+        inherited = f"<code>{conn_user}@{conn_host}:22</code>"
+        self._ssh_target_lbl = QLabel(
+            f"<span style='color:#8888aa'>SSH target (inherited from bookmark):</span><br>{inherited}"
+        )
+        self._ssh_target_lbl.setTextFormat(Qt.RichText)
+        layout.addRow(self._ssh_target_lbl)
 
-        self.ssh_user = QLineEdit(getattr(p, "power_ssh_user", "") or "")
-        self.ssh_user.setPlaceholderText("leave empty to use bookmark username")
-        layout.addRow("SSH User:", self.ssh_user)
-
+        # SSH key — only override that makes sense to expose
+        self._ssh_key_label = QLabel("SSH Key:")
         self.ssh_key = QLineEdit(getattr(p, "power_ssh_key", "") or "")
-        self.ssh_key.setPlaceholderText("~/.ssh/id_rsa  (empty = agent / password)")
-        layout.addRow("SSH Key:", self.ssh_key)
+        self.ssh_key.setPlaceholderText("~/.ssh/id_rsa  (empty = SSH agent)")
+        layout.addRow(self._ssh_key_label, self.ssh_key)
 
-        layout.addRow(self._separator("Wake-on-LAN (for Power On)"))
+        # WoL section
+        self._wol_sep = self._separator("Wake-on-LAN — Power On")
+        layout.addRow(self._wol_sep)
 
+        self._wol_mac_label = QLabel("MAC Address:")
         self.wol_mac = QLineEdit(getattr(p, "power_wol_mac", "") or "")
         self.wol_mac.setPlaceholderText("aa:bb:cc:dd:ee:ff")
-        layout.addRow("MAC Address:", self.wol_mac)
-
-        self.wol_broadcast = QLineEdit(
-            getattr(p, "power_wol_broadcast", "") or "255.255.255.255")
-        layout.addRow("Broadcast:", self.wol_broadcast)
+        layout.addRow(self._wol_mac_label, self.wol_mac)
 
         btn_row = QHBoxLayout()
         save_btn = QPushButton("Save")
@@ -421,22 +430,24 @@ class PowerSettingsDialog(QDialog):
     def _update_visibility(self):
         backend = self.backend.currentData() or ""
         ssh_visible = backend in ("ssh", "teraguchi")
-        # We don't hide fields — just grey out the labels to keep layout stable
-        for w in (self.ssh_host, self.ssh_user, self.ssh_key):
-            w.setEnabled(ssh_visible)
-        self.wol_mac.setEnabled(backend in ("ssh", "wol", "teraguchi"))
-        self.wol_broadcast.setEnabled(backend in ("ssh", "wol", "teraguchi"))
+        wol_visible = backend in ("ssh", "wol", "teraguchi")
+        os_visible  = backend in ("ssh", "teraguchi")
+
+        for w in (self._ssh_sep, self._ssh_target_lbl, self._ssh_key_label, self.ssh_key):
+            w.setVisible(ssh_visible)
+        for w in (self._wol_sep, self._wol_mac_label, self.wol_mac):
+            w.setVisible(wol_visible)
+        for w in (self._os_label, self.os_combo):
+            w.setVisible(os_visible)
 
     @property
     def values(self) -> dict:
         return {
             "power_backend":       self.backend.currentData() or "",
             "power_os":            self.os_combo.currentData() or "linux",
-            "power_ssh_host":      self.ssh_host.text().strip(),
-            "power_ssh_user":      self.ssh_user.text().strip(),
             "power_ssh_key":       self.ssh_key.text().strip(),
             "power_wol_mac":       self.wol_mac.text().strip(),
-            "power_wol_broadcast": self.wol_broadcast.text().strip() or "255.255.255.255",
+            # host/user/broadcast intentionally not stored — inherited from profile
         }
 
 

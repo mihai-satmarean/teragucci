@@ -538,12 +538,15 @@ class ConnectionProfile:
     #   teraguchi — in-band off/reboot via live session; falls back to ssh
     #   none / "" — power buttons hidden
     power_backend: str = ""
-    power_os: str = "linux"           # "linux" or "windows" (controls shutdown command)
-    power_ssh_host: str = ""          # SSH host override (defaults to profile.host)
-    power_ssh_user: str = ""          # SSH user (defaults to profile.username)
-    power_ssh_key: str = ""           # Path to SSH private key (empty = agent/password)
-    power_wol_mac: str = ""           # MAC address for Wake-on-LAN (e.g. "aa:bb:cc:dd:ee:ff")
-    power_wol_broadcast: str = "255.255.255.255"  # WoL broadcast address
+    power_os: str = "linux"              # "linux" | "windows" (controls shutdown command)
+    # SSH overrides — normally empty; host/user are inherited from profile.host/username
+    power_ssh_host: str = ""            # override SSH host (e.g. bastion); empty = profile.host
+    power_ssh_user: str = ""            # override SSH user; empty = profile.username
+    power_ssh_port: int = 22            # SSH port (always 22, not the teraguchi streaming port)
+    power_ssh_key: str = ""             # path to SSH private key; empty = SSH agent
+    # Wake-on-LAN
+    power_wol_mac: str = ""             # MAC address for WoL (e.g. "aa:bb:cc:dd:ee:ff")
+    power_wol_broadcast: str = "255.255.255.255"
 
     def to_dict(self) -> dict:
         return asdict(self)

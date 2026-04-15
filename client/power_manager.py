@@ -64,25 +64,30 @@ def _ssh_remote_cmd(action: str, os_type: str) -> list[str]:
     raise ValueError(f"Unknown action {action!r} for OS {os_type!r}")
 
 
-def ssh_power(action: str, host: str, user: str = "",
+def ssh_power(action: str, host: str, user: str = "", port: int = 22,
               key_path: str = "", os_type: str = "linux",
               timeout: int = 10) -> None:
-    """Run a power command on a remote host via SSH."""
+    """Run a power command on a remote host via SSH.
+
+    Always connects to port 22 (standard SSH), not the teraguchi streaming port.
+    Authentication order: explicit key → SSH agent → system default.
+    """
     remote_cmd = _ssh_remote_cmd(action, os_type)
     ssh_cmd = [
         "ssh",
         "-o", "StrictHostKeyChecking=no",
         "-o", f"ConnectTimeout={timeout}",
         "-o", "BatchMode=yes",
+        "-p", str(port),
     ]
     if key_path:
         ssh_cmd += ["-i", key_path]
     target = f"{user}@{host}" if user else host
     full_cmd = ssh_cmd + [target] + remote_cmd
 
-    logger.info("SSH power %s → %s", action, target)
+    logger.info("SSH power %s → %s:%d", action, target, port)
     result = subprocess.run(full_cmd, capture_output=True, timeout=timeout + 5)
-    # rc 255 = SSH connection closed, which is expected when the remote shuts down
+    # rc 255 = SSH connection closed, expected when remote shuts down mid-command
     if result.returncode not in (0, 255):
         stderr = result.stderr.decode(errors="replace")[:300]
         raise RuntimeError(f"SSH rc={result.returncode}: {stderr}")
@@ -163,16 +168,21 @@ class PowerManager:
                 except Exception as exc:
                     logger.warning("In-band power failed (%s) — trying SSH", exc)
 
-        # 2. SSH
+        # 2. SSH — host/user inherited from bookmark profile; only key is an override
+        # power_ssh_host / power_ssh_user are model-level overrides for edge cases
+        # (e.g. bastion host). In normal use they're empty and we fall back to the
+        # bookmark's own host/username.
         ssh_host = getattr(self._p, "power_ssh_host", "") or getattr(self._p, "host", "")
         ssh_user = getattr(self._p, "power_ssh_user", "") or getattr(self._p, "username", "")
         ssh_key  = getattr(self._p, "power_ssh_key", "") or ""
+        # Always use standard SSH port 22, not the teraguchi streaming port
+        ssh_port = int(getattr(self._p, "power_ssh_port", 0) or 22)
 
         if not ssh_host:
             return f"{action_label} not available: no SSH host and no active session."
 
         try:
-            ssh_power(action, ssh_host, ssh_user, ssh_key, os_type)
+            ssh_power(action, ssh_host, ssh_user, ssh_port, ssh_key, os_type)
             return f"{action_label} command sent to {ssh_host}."
         except Exception as exc:
             return f"{action_label} via SSH failed: {exc}"
