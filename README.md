@@ -81,7 +81,8 @@ Commercial remote desktop tools cost thousands per seat, lock you into proprieta
 - Bookmark panel shows a live **connection status dot** per entry (green = connected, gray = idle)
 - **Disconnect from bookmark panel** — double-click or right-click an active bookmark to disconnect without navigating tabs
 - **Bookmark panel is hidden by default** — press **B** or use View → Bookmarks to toggle; state persists across restarts
-- **Power management** — each bookmark can configure a power backend to control the remote machine (see [Power Management](#power-management))
+- **Branded disconnect overlay** — when a session disconnects or is connecting, the viewer shows a branded "teraguchi" overlay with status and hostname instead of freezing the last video frame
+- **Power management** — each bookmark can configure a power backend (SSH, Wake-on-LAN, teraguchi in-band); a power icon appears per row and right-click exposes Power On / Power Off / Reboot (see [Power Management](#power-management))
 
 ### Health Monitoring
 - Real-time overlay (F9) — RTT, FPS, bandwidth, dropped frames, encode/capture timing
@@ -300,66 +301,83 @@ The virtual sink persists only while a client is connected; it is removed on dis
 
 Each bookmark can optionally configure a **power backend** to control the remote machine directly from the bookmark panel — without needing an active session.
 
-Power actions available: **Power On**, **Power Off**, **Reboot**, **Suspend**.
+**UI:** When a bookmark has power management configured, a small power icon appears on the right side of its row. Left-clicking the icon or right-clicking the bookmark → **Power** opens a menu with **Power On**, **Power Off**, and **Reboot**. Power Off and Reboot require confirmation. To configure power settings, right-click → **Power Settings...**.
 
 #### Supported backends
 
-| Type | Use case | Notes |
+| Backend | Power On | Power Off / Reboot | Notes |
+|---|---|---|---|
+| `ssh` | WoL (if MAC configured) | SSH `systemctl poweroff/reboot` | Works for Linux and Windows |
+| `teraguchi` | WoL (if MAC configured) | In-band via live session; falls back to SSH | Best option when teraguchi server is running |
+| `wol` | Wake-on-LAN | — | Power-on only; no off/reboot |
+| `none` / empty | — | — | Power buttons hidden in UI |
+
+#### Bookmark fields
+
+Power settings are stored as flat fields inside the bookmark JSON (`~/.config/teraguchi/bookmarks.json` on Linux, `~/Library/Application Support/Teraguchi/bookmarks.json` on macOS). They can also be set via **right-click → Power Settings...** in the UI.
+
+| Field | Default | Description |
 |---|---|---|
-| `wol` | Physical desktops | Wake-on-LAN magic packet (client-side UDP, no deps) |
-| `ipmi` | Servers with BMC | Requires `ipmitool` on the client |
-| `redfish` | iDRAC / iLO / BMC REST | Pure HTTP, no binary needed |
-| `ssh` | Any Linux or Windows via OpenSSH | Linux: `systemctl poweroff/reboot` · Windows: `shutdown /s /t 0` |
-| `ansible` | Cloud VMs, KubeVirt, Proxmox | SSHes into a control node and runs `ansible-playbook` |
-| `awx` | AWX / Tower managed infra | REST API job launch; no direct SSH to control node needed |
-| `teraguchi` | Fallback when connected | Server-side `systemctl poweroff/reboot` via active session |
-| `none` | No power control | — |
+| `power_backend` | `""` | `"ssh"`, `"teraguchi"`, `"wol"`, `"none"`, or `""` (disabled) |
+| `power_os` | `"linux"` | `"linux"` or `"windows"` — controls which shutdown command is sent |
+| `power_ssh_host` | `""` | SSH host override; empty = use the bookmark's host |
+| `power_ssh_user` | `""` | SSH user; empty = use the bookmark's username |
+| `power_ssh_key` | `""` | Path to SSH private key; empty = SSH agent or password |
+| `power_wol_mac` | `""` | MAC address for Wake-on-LAN, e.g. `"aa:bb:cc:dd:ee:ff"` |
+| `power_wol_broadcast` | `"255.255.255.255"` | WoL broadcast address (change for a specific subnet) |
 
-#### Bookmark JSON examples
+#### Examples
 
-```json
-{ "power_backend": { "type": "wol", "mac": "aa:bb:cc:dd:ee:ff", "broadcast": "192.168.1.255" } }
-```
+Linux workstation — SSH off/reboot + WoL power-on:
 
 ```json
 {
-  "power_backend": {
-    "type": "ansible",
-    "ssh_host": "control-node.example.com",
-    "ssh_user": "ansible",
-    "ssh_key": "~/.ssh/id_rsa",
-    "playbook_start": "role-aws_CRUD/tasks/infrastructure_objects/instance/actions/start.yml",
-    "playbook_stop":  "role-aws_CRUD/tasks/infrastructure_objects/instance/actions/stop.yml",
-    "extra_vars": { "instance_name": "my-vm", "region": "eu-central-1", "aws_profile": "my_profile" }
-  }
+  "power_backend": "ssh",
+  "power_os": "linux",
+  "power_ssh_user": "mihai",
+  "power_ssh_key": "~/.ssh/id_rsa",
+  "power_wol_mac": "aa:bb:cc:dd:ee:ff"
 }
 ```
 
+Windows workstation — SSH off/reboot via OpenSSH + WoL:
+
 ```json
 {
-  "power_backend": {
-    "type": "ssh",
-    "host": "192.168.1.100",
-    "user": "admin",
-    "key": "~/.ssh/id_rsa",
-    "os": "windows"
-  }
+  "power_backend": "ssh",
+  "power_os": "windows",
+  "power_ssh_host": "192.168.1.50",
+  "power_ssh_user": "Administrator",
+  "power_ssh_key": "~/.ssh/id_rsa",
+  "power_wol_mac": "bb:cc:dd:ee:ff:00"
+}
+```
+
+teraguchi server running — in-band shutdown with SSH fallback + WoL:
+
+```json
+{
+  "power_backend": "teraguchi",
+  "power_os": "linux",
+  "power_ssh_user": "mihai",
+  "power_ssh_key": "~/.ssh/id_rsa",
+  "power_wol_mac": "aa:bb:cc:dd:ee:ff"
 }
 ```
 
 #### Fallback logic
 
 ```
-Power ON:  ansible / awx / wol / ipmi / redfish → on failure → show error
-Power OFF: 1. teraguchi connection (if active) → server-side shutdown
-           2. ansible / awx / ssh / ipmi / redfish
-           3. on failure → show error
-Reboot:    same as Power OFF but with reboot action
+Power On:  → send WoL magic packet to power_wol_mac
+Power Off: 1. backend is "teraguchi" AND session is connected → POWER_ACTION over WebSocket
+           2. SSH to power_ssh_host (or bookmark host) → sudo systemctl poweroff / Stop-Computer
+           3. No SSH host configured → show error
+Reboot:    same as Power Off but with reboot command
 ```
 
-> Credentials for power backends are stored encrypted alongside bookmark credentials.
+> **Server requirement for teraguchi in-band:** the server runs the systemctl command directly, so the `teraguchi` system user (or the session user) needs passwordless sudo for `systemctl poweroff` and `systemctl reboot`.
 
-> **Windows:** the `ssh` backend with `"os": "windows"` sends `shutdown /s /t 0` (off) or `shutdown /r /t 0` (reboot) via OpenSSH. The `ansible` backend can use `win_reboot` / `win_shell` modules via WinRM or SSH transport. Hardware-level backends (`wol`, `ipmi`, `redfish`) are OS-agnostic.
+> **Windows SSH commands:** `Stop-Computer -Force` (off) and `Restart-Computer -Force` (reboot) via PowerShell over OpenSSH. Requires OpenSSH server to be installed and running on the Windows machine.
 
 ### USB Device Forwarding
 

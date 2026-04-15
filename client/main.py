@@ -334,6 +334,108 @@ class BookmarkDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class PowerSettingsDialog(QDialog):
+    """Edit power management settings for one bookmark."""
+
+    def __init__(self, parent=None, profile=None):
+        super().__init__(parent)
+        self.setWindowTitle("Power Settings")
+        self.setMinimumWidth(420)
+
+        layout = QFormLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setLabelAlignment(Qt.AlignRight)
+
+        p = profile
+
+        # Backend
+        self.backend = QComboBox()
+        self.backend.addItem("Disabled", "")
+        self.backend.addItem("SSH  (off/reboot via SSH; WoL for power-on)", "ssh")
+        self.backend.addItem("teraguchi  (in-band; falls back to SSH)", "teraguchi")
+        self.backend.addItem("WoL only  (power-on only)", "wol")
+        cur = getattr(p, "power_backend", "") or ""
+        idx = {v: i for i, (_, v) in enumerate(
+            [("", ""), ("ssh", "ssh"), ("teraguchi", "teraguchi"), ("wol", "wol")]
+        )}.get(cur, 0)
+        self.backend.setCurrentIndex(idx)
+        layout.addRow("Backend:", self.backend)
+
+        # OS
+        self.os_combo = QComboBox()
+        self.os_combo.addItem("Linux", "linux")
+        self.os_combo.addItem("Windows", "windows")
+        os_val = getattr(p, "power_os", "linux") or "linux"
+        self.os_combo.setCurrentIndex(0 if os_val == "linux" else 1)
+        layout.addRow("Remote OS:", self.os_combo)
+
+        layout.addRow(self._separator("SSH (for Power Off / Reboot)"))
+
+        self.ssh_host = QLineEdit(getattr(p, "power_ssh_host", "") or "")
+        self.ssh_host.setPlaceholderText("leave empty to use bookmark host")
+        layout.addRow("SSH Host:", self.ssh_host)
+
+        self.ssh_user = QLineEdit(getattr(p, "power_ssh_user", "") or "")
+        self.ssh_user.setPlaceholderText("leave empty to use bookmark username")
+        layout.addRow("SSH User:", self.ssh_user)
+
+        self.ssh_key = QLineEdit(getattr(p, "power_ssh_key", "") or "")
+        self.ssh_key.setPlaceholderText("~/.ssh/id_rsa  (empty = agent / password)")
+        layout.addRow("SSH Key:", self.ssh_key)
+
+        layout.addRow(self._separator("Wake-on-LAN (for Power On)"))
+
+        self.wol_mac = QLineEdit(getattr(p, "power_wol_mac", "") or "")
+        self.wol_mac.setPlaceholderText("aa:bb:cc:dd:ee:ff")
+        layout.addRow("MAC Address:", self.wol_mac)
+
+        self.wol_broadcast = QLineEdit(
+            getattr(p, "power_wol_broadcast", "") or "255.255.255.255")
+        layout.addRow("Broadcast:", self.wol_broadcast)
+
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        save_btn.setDefault(True)
+        cancel_btn = QPushButton("Cancel")
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        layout.addRow(btn_row)
+
+        save_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+
+        self.backend.currentIndexChanged.connect(self._update_visibility)
+        self._update_visibility()
+
+    def _separator(self, text: str) -> QLabel:
+        lbl = QLabel(f"<span style='color:#6c6c8a; font-size:10px'>{text}</span>")
+        lbl.setTextFormat(Qt.RichText)
+        return lbl
+
+    def _update_visibility(self):
+        backend = self.backend.currentData() or ""
+        ssh_visible = backend in ("ssh", "teraguchi")
+        # We don't hide fields — just grey out the labels to keep layout stable
+        for w in (self.ssh_host, self.ssh_user, self.ssh_key):
+            w.setEnabled(ssh_visible)
+        self.wol_mac.setEnabled(backend in ("ssh", "wol", "teraguchi"))
+        self.wol_broadcast.setEnabled(backend in ("ssh", "wol", "teraguchi"))
+
+    @property
+    def values(self) -> dict:
+        return {
+            "power_backend":       self.backend.currentData() or "",
+            "power_os":            self.os_combo.currentData() or "linux",
+            "power_ssh_host":      self.ssh_host.text().strip(),
+            "power_ssh_user":      self.ssh_user.text().strip(),
+            "power_ssh_key":       self.ssh_key.text().strip(),
+            "power_wol_mac":       self.wol_mac.text().strip(),
+            "power_wol_broadcast": self.wol_broadcast.text().strip() or "255.255.255.255",
+        }
+
+
 class BookmarkPanel(QWidget):
     connect_requested = Signal(str)
     disconnect_requested = Signal(str)
@@ -474,8 +576,11 @@ class BookmarkPanel(QWidget):
             power_menu.addAction("Reboot",
                                  lambda: self.power_action_requested.emit(bid, "reboot"))
         menu.addSeparator()
-        menu.addAction(icons.icon_edit(), "Edit",
+        menu.addAction(icons.icon_edit(), "Edit Connection",
                        lambda: self._edit_bookmark(bid))
+        menu.addAction(icons.icon_power(), "Power Settings...",
+                       lambda: self._edit_power(bid))
+        menu.addSeparator()
         menu.addAction(icons.icon_trash(), "Delete",
                        lambda: self._delete_bookmark(bid))
         menu.exec(self._list.mapToGlobal(pos))
@@ -522,6 +627,15 @@ class BookmarkPanel(QWidget):
                              host=dialog.host, port=dialog.port,
                              username=dialog.username, password=dialog.password,
                              use_tls=dialog.use_tls)
+            self._refresh()
+
+    def _edit_power(self, bid):
+        profile = self._mgr.get(bid)
+        if not profile:
+            return
+        dlg = PowerSettingsDialog(self, profile)
+        if dlg.exec() == QDialog.Accepted:
+            self._mgr.update(bid, **dlg.values)
             self._refresh()
 
     def _delete_bookmark(self, bid):
