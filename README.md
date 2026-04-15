@@ -81,6 +81,7 @@ Commercial remote desktop tools cost thousands per seat, lock you into proprieta
 - Bookmark panel shows a live **connection status dot** per entry (green = connected, gray = idle)
 - **Disconnect from bookmark panel** — double-click or right-click an active bookmark to disconnect without navigating tabs
 - **Bookmark panel is hidden by default** — press **B** or use View → Bookmarks to toggle; state persists across restarts
+- **Power management** — each bookmark can configure a power backend to control the remote machine (see [Power Management](#power-management))
 
 ### Health Monitoring
 - Real-time overlay (F9) — RTT, FPS, bandwidth, dropped frames, encode/capture timing
@@ -294,6 +295,71 @@ On the **server**, a PulseAudio virtual sink named `teraguchi_mic` is created. A
 The virtual sink persists only while a client is connected; it is removed on disconnect.
 
 > **Requirement:** PulseAudio must be running in the user's session on the server. If no mic audio appears, check `pactl info` on the server to verify the PulseAudio daemon is active.
+
+### Power Management
+
+Each bookmark can optionally configure a **power backend** to control the remote machine directly from the bookmark panel — without needing an active session.
+
+Power actions available: **Power On**, **Power Off**, **Reboot**, **Suspend**.
+
+#### Supported backends
+
+| Type | Use case | Notes |
+|---|---|---|
+| `wol` | Physical desktops | Wake-on-LAN magic packet (client-side UDP, no deps) |
+| `ipmi` | Servers with BMC | Requires `ipmitool` on the client |
+| `redfish` | iDRAC / iLO / BMC REST | Pure HTTP, no binary needed |
+| `ssh` | Any Linux or Windows via OpenSSH | Linux: `systemctl poweroff/reboot` · Windows: `shutdown /s /t 0` |
+| `ansible` | Cloud VMs, KubeVirt, Proxmox | SSHes into a control node and runs `ansible-playbook` |
+| `awx` | AWX / Tower managed infra | REST API job launch; no direct SSH to control node needed |
+| `teraguchi` | Fallback when connected | Server-side `systemctl poweroff/reboot` via active session |
+| `none` | No power control | — |
+
+#### Bookmark JSON examples
+
+```json
+{ "power_backend": { "type": "wol", "mac": "aa:bb:cc:dd:ee:ff", "broadcast": "192.168.1.255" } }
+```
+
+```json
+{
+  "power_backend": {
+    "type": "ansible",
+    "ssh_host": "control-node.example.com",
+    "ssh_user": "ansible",
+    "ssh_key": "~/.ssh/id_rsa",
+    "playbook_start": "role-aws_CRUD/tasks/infrastructure_objects/instance/actions/start.yml",
+    "playbook_stop":  "role-aws_CRUD/tasks/infrastructure_objects/instance/actions/stop.yml",
+    "extra_vars": { "instance_name": "my-vm", "region": "eu-central-1", "aws_profile": "my_profile" }
+  }
+}
+```
+
+```json
+{
+  "power_backend": {
+    "type": "ssh",
+    "host": "192.168.1.100",
+    "user": "admin",
+    "key": "~/.ssh/id_rsa",
+    "os": "windows"
+  }
+}
+```
+
+#### Fallback logic
+
+```
+Power ON:  ansible / awx / wol / ipmi / redfish → on failure → show error
+Power OFF: 1. teraguchi connection (if active) → server-side shutdown
+           2. ansible / awx / ssh / ipmi / redfish
+           3. on failure → show error
+Reboot:    same as Power OFF but with reboot action
+```
+
+> Credentials for power backends are stored encrypted alongside bookmark credentials.
+
+> **Windows:** the `ssh` backend with `"os": "windows"` sends `shutdown /s /t 0` (off) or `shutdown /r /t 0` (reboot) via OpenSSH. The `ansible` backend can use `win_reboot` / `win_shell` modules via WinRM or SSH transport. Hardware-level backends (`wol`, `ipmi`, `redfish`) are OS-agnostic.
 
 ### USB Device Forwarding
 
