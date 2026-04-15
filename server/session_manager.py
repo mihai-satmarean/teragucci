@@ -20,6 +20,7 @@ import pwd
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -294,6 +295,8 @@ class UserSession:
     # the fd destroys the device) and to hand it to the input injector.
     pen_tablet: Optional["VirtualPenTablet"] = None
     pen_tablet_event: str = ""  # /dev/input/eventN path
+    # WM watchdog — set to True in _cleanup_session() to stop the thread
+    wm_watchdog_stop: bool = False
 
     @property
     def alive(self) -> bool:
@@ -434,6 +437,9 @@ class SessionManager:
                 # Give D-Bus and X server time to fully initialize
                 time.sleep(1)
             self._start_window_manager(session)
+            # Background watchdog restarts the WM if it crashes (e.g. on
+            # fresh boot before logind/D-Bus are fully ready)
+            self._start_wm_watchdog(session)
 
         # Start X compositor so screen capture reads coherent framebuffers
         # (fixes tearing during video playback). gnome-shell is already a
@@ -1104,6 +1110,57 @@ EndSection
             logger.warning("Could not enable linger for %s: %s", username, e)
         return False
 
+    def _start_wm_watchdog(self, session: UserSession):
+        """Start a background thread that restarts the WM if it crashes.
+
+        This handles the common failure mode on headless machines after a
+        fresh boot: gnome-shell starts before D-Bus / logind are fully
+        initialised, crashes within the first few seconds, and then stays
+        dead as a zombie because no user has connected yet (so
+        get_session() is never called).
+
+        Backoff schedule: 3 s, 6 s, 12 s, 24 s, 48 s, capped at 60 s.
+        The thread exits when Xorg dies (session truly gone) or when
+        session.wm_watchdog_stop is set (cleanup_session called).
+        """
+        session.wm_watchdog_stop = False
+
+        def _watchdog():
+            backoff = 3.0
+            while not session.wm_watchdog_stop:
+                # Exit immediately if Xorg itself is gone
+                if session.xorg_proc and session.xorg_proc.poll() is not None:
+                    logger.debug("WM watchdog: Xorg gone for %s — exiting",
+                                 session.username)
+                    return
+
+                proc = session.wm_proc
+                if proc is not None and proc.poll() is not None:
+                    rc = proc.returncode
+                    if session.wm_watchdog_stop:
+                        return
+                    logger.warning(
+                        "WM watchdog: WM exited (rc=%s) for %s — "
+                        "restarting in %.0fs",
+                        rc, session.username, backoff)
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 60.0)
+                    if session.wm_watchdog_stop:
+                        return
+                    self._start_window_manager(session)
+                    # Reset backoff after a successful long-running restart
+                    # (detected on next iteration)
+                else:
+                    # WM is running — reset backoff and wait
+                    backoff = 3.0
+                    time.sleep(5.0)
+
+        t = threading.Thread(target=_watchdog,
+                             name=f"wm-watchdog-{session.username}",
+                             daemon=True)
+        t.start()
+        logger.debug("WM watchdog started for %s", session.username)
+
     def _start_window_manager(self, session: UserSession):
         try:
             env = session.env.copy()
@@ -1301,6 +1358,10 @@ EndSection
             logger.info("Session destroyed: %s", username)
 
     def _cleanup_session(self, session: UserSession):
+        # Signal the WM watchdog thread to stop before killing processes,
+        # so it doesn't race to restart gnome-shell while we're tearing down.
+        session.wm_watchdog_stop = True
+
         # Close the pen tablet first so the uinput device is destroyed
         # before Xorg shuts down (avoids stale input device errors in log).
         if session.pen_tablet:
