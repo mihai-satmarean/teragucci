@@ -257,8 +257,8 @@ class BrokerMachinePicker(QDialog):
 class BookmarkDelegate(QStyledItemDelegate):
     """Custom delegate for bookmark items — card-style with server icon."""
 
-    # How wide the power icon hit-area is (pixels from the right edge of the card)
-    POWER_ZONE_WIDTH = 32
+    # Left icon hit-area width (from card left edge): 8px margin + 20px icon + 8px buffer
+    ICON_ZONE_WIDTH = 36
 
     def __init__(self, parent=None, active_ids=None, power_ids=None):
         super().__init__(parent)
@@ -286,10 +286,29 @@ class BookmarkDelegate(QStyledItemDelegate):
             painter.setBrush(Qt.NoBrush)
             painter.setPen(Qt.NoPen)
 
-        # Server icon
-        icon = icons.icon_server(theme.TEXT_SECONDARY)
-        icon_rect = rect.adjusted(8, 10, 0, 0)
-        icon.paint(painter, icon_rect.x(), icon_rect.y(), 20, 20)
+        bid   = index.data(Qt.UserRole)
+        hover = bool(option.state & QStyle.State_MouseOver)
+        has_power = bid in self._power_ids
+
+        # Left icon: server icon normally; on hover morph into power icon
+        ix = rect.x() + 8
+        iy = rect.center().y() - 10
+        if hover:
+            if has_power:
+                icons.icon_power(theme.WARNING).paint(painter, ix, iy, 20, 20)
+            else:
+                # Faint power icon — click opens Power Settings
+                painter.setOpacity(0.35)
+                icons.icon_power(theme.TEXT_MUTED).paint(painter, ix, iy, 20, 20)
+                painter.setOpacity(1.0)
+        else:
+            # Normal state: server icon, with small power badge dot if configured
+            icons.icon_server(theme.TEXT_SECONDARY).paint(painter, ix, iy, 20, 20)
+            if has_power:
+                # Small orange dot badge on bottom-right of server icon
+                painter.setBrush(QColor(theme.WARNING))
+                painter.setPen(Qt.NoPen)
+                painter.drawEllipse(ix + 13, iy + 13, 6, 6)
 
         # Name (bold)
         name = index.data(Qt.UserRole + 1) or "Unnamed"
@@ -298,7 +317,7 @@ class BookmarkDelegate(QStyledItemDelegate):
         name_font.setWeight(QFont.DemiBold)
         name_font.setPointSize(12)
         painter.setFont(name_font)
-        painter.drawText(rect.adjusted(36, 6, -42, -22), Qt.AlignLeft | Qt.AlignVCenter, name)
+        painter.drawText(rect.adjusted(36, 6, -20, -22), Qt.AlignLeft | Qt.AlignVCenter, name)
 
         # Host:port (secondary)
         host_text = index.data(Qt.UserRole + 2) or ""
@@ -306,10 +325,9 @@ class BookmarkDelegate(QStyledItemDelegate):
         sub_font = QFont()
         sub_font.setPointSize(10)
         painter.setFont(sub_font)
-        painter.drawText(rect.adjusted(36, 24, -42, -2), Qt.AlignLeft | Qt.AlignVCenter, host_text)
+        painter.drawText(rect.adjusted(36, 24, -20, -2), Qt.AlignLeft | Qt.AlignVCenter, host_text)
 
-        # Connection status dot (right side)
-        bid = index.data(Qt.UserRole)
+        # Connection status dot (right side only)
         is_active = bid in self._active_ids
         dot_color = QColor(theme.SUCCESS) if is_active else QColor(theme.TEXT_MUTED)
         dot_color.setAlpha(200 if is_active else 80)
@@ -319,21 +337,6 @@ class BookmarkDelegate(QStyledItemDelegate):
         dot_x = rect.right() - dot_size - 8
         dot_y = rect.center().y() - dot_size // 2
         painter.drawEllipse(dot_x, dot_y, dot_size, dot_size)
-
-        # Power icon — always shown on hover; solid/warm when configured, faint when not
-        hover = bool(option.state & QStyle.State_MouseOver)
-        has_power = bid in self._power_ids
-        px = dot_x - 22 - 4
-        py = rect.center().y() - 10
-        if has_power:
-            # Configured: always visible (secondary), warm on hover
-            color = theme.WARNING if hover else theme.TEXT_SECONDARY
-            icons.icon_power(color).paint(painter, px, py, 20, 20)
-        elif hover:
-            # Not configured: very faint hint on hover — click opens Power Settings
-            painter.setOpacity(0.3)
-            icons.icon_power(theme.TEXT_MUTED).paint(painter, px, py, 20, 20)
-            painter.setOpacity(1.0)
 
         painter.restore()
 
@@ -522,7 +525,7 @@ class BookmarkPanel(QWidget):
         self._refresh()
 
     def eventFilter(self, obj, event):
-        """Detect left-click on the power icon zone inside a bookmark row."""
+        """Detect left-click on the left icon zone (server/power icon) of a bookmark row."""
         from PySide6.QtCore import QEvent
         if obj is self._list.viewport() and event.type() == QEvent.MouseButtonPress:
             from PySide6.QtCore import Qt as _Qt
@@ -530,9 +533,10 @@ class BookmarkPanel(QWidget):
                 item = self._list.itemAt(event.pos())
                 if item:
                     rect = self._list.visualItemRect(item)
-                    # Power zone: left edge = rect.right() - dot(16) - icon(20) - gap(4) - margin(8)
-                    power_zone_left = rect.right() - 16 - 24 - 8
-                    if event.pos().x() >= power_zone_left:
+                    # Power zone: left icon area (8px margin + 20px icon + small buffer)
+                    icon_left  = rect.left() + 4   # card starts at rect.left()+4
+                    icon_right = icon_left + 36    # 8px gap + 20px icon + 8px buffer
+                    if icon_left <= event.pos().x() <= icon_right:
                         bid = item.data(Qt.UserRole)
                         if bid in self._power_ids:
                             self._show_power_menu(bid, event.globalPosition().toPoint())
