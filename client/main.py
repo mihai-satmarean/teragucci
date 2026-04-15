@@ -307,10 +307,12 @@ class BookmarkDelegate(QStyledItemDelegate):
         else:
             icons.icon_server(theme.TEXT_SECONDARY).paint(painter, ix, iy, 20, 20)
             if has_power:
-                # Small orange dot badge on bottom-right of server icon
-                painter.setBrush(QColor(theme.WARNING))
-                painter.setPen(Qt.NoPen)
-                painter.drawEllipse(ix + 13, iy + 13, 6, 6)
+                # Small ⏻ badge on bottom-right of server icon
+                badge_font = QFont()
+                badge_font.setPointSize(7)
+                painter.setFont(badge_font)
+                painter.setPen(QColor(theme.WARNING))
+                painter.drawText(ix + 10, iy + 10, 12, 12, Qt.AlignCenter, "\u23fb")
 
         # Name (bold)
         name = index.data(Qt.UserRole + 1) or "Unnamed"
