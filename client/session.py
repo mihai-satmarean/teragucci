@@ -511,3 +511,16 @@ class Session(QObject):
     def usb_refresh(self):
         """Re-enumerate and send device list."""
         self._send_usb_device_list()
+
+    def send_power_action(self, action: str):
+        """Ask the server to execute a power action on the remote machine.
+
+        action: "power_off" | "reboot"
+
+        The server must have appropriate sudo privileges to execute the
+        underlying systemctl command.
+        """
+        from common.messages import MsgType
+        if not self.is_connected:
+            raise RuntimeError("Not connected")
+        self.protocol.send_input({"type": MsgType.POWER_ACTION, "action": action})

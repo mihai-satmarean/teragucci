@@ -604,6 +604,20 @@ class SessionRuntime:
                 if response:
                     self._send_to_client(session, response)
 
+        elif msg_type == MsgType.POWER_ACTION:
+            import subprocess as _sp
+            action = msg.get("action", "")
+            if action == "power_off":
+                logger.info("Power action: shutdown requested by client %s",
+                            session.client_host)
+                _sp.Popen(["sudo", "systemctl", "poweroff"])
+            elif action == "reboot":
+                logger.info("Power action: reboot requested by client %s",
+                            session.client_host)
+                _sp.Popen(["sudo", "systemctl", "reboot"])
+            else:
+                logger.warning("Unknown POWER_ACTION %r — ignored", action)
+
         elif msg_type == MsgType.CLIENT_HELLO:
             session.supports_h264 = msg.get("supports_h264", True)
             session.supports_h265 = msg.get("supports_h265", False)

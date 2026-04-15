@@ -189,6 +189,10 @@ class MsgType:
     BROKER_STATUS = "broker_status"            # Client → Broker: request status refresh
     BROKER_RELEASE = "broker_release"          # Client → Broker: release machine assignment
 
+    # --- Power Management (Client → Server) ---
+    # Server executes the action on the local machine (requires sudo privileges)
+    POWER_ACTION = "power_action"              # action: "power_off" | "reboot"
+
 
 # ============================================================
 # Quality Control
@@ -526,6 +530,20 @@ class ConnectionProfile:
     created: str = ""
     color_label: str = ""  # For visual organization
     mode: str = "direct"  # "direct" or "broker"
+
+    # Power management (optional — leave empty to disable)
+    # power_backend: "ssh" | "wol" | "teraguchi" | "none" | ""
+    #   ssh       — SSH commands for off/reboot; wol_mac for power-on
+    #   wol       — Wake-on-LAN only (power-on); no off/reboot
+    #   teraguchi — in-band off/reboot via live session; falls back to ssh
+    #   none / "" — power buttons hidden
+    power_backend: str = ""
+    power_os: str = "linux"           # "linux" or "windows" (controls shutdown command)
+    power_ssh_host: str = ""          # SSH host override (defaults to profile.host)
+    power_ssh_user: str = ""          # SSH user (defaults to profile.username)
+    power_ssh_key: str = ""           # Path to SSH private key (empty = agent/password)
+    power_wol_mac: str = ""           # MAC address for Wake-on-LAN (e.g. "aa:bb:cc:dd:ee:ff")
+    power_wol_broadcast: str = "255.255.255.255"  # WoL broadcast address
 
     def to_dict(self) -> dict:
         return asdict(self)
