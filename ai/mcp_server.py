@@ -74,6 +74,39 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("teraguchi")
 
 
+# ── Auto-connect helper ───────────────────────────────────────────
+
+
+def _ensure_connected() -> str | None:
+    """
+    If the active adapter is not connected and env vars are available,
+    connect now.  Returns an error string on failure, None on success.
+
+    This replaces the old background preconnect thread.  Tools that need
+    a live session call this at the top; the first call takes a few seconds,
+    subsequent calls return immediately because the adapter is already connected.
+    """
+    adapter = registry.active
+    if adapter.connected:
+        return None
+
+    host = os.environ.get("TERAGUCHI_HOST", "")
+    user = os.environ.get("TERAGUCHI_USER", "")
+    pw   = os.environ.get("TERAGUCHI_PASS", "")
+    port = int(os.environ.get("TERAGUCHI_PORT", "4443"))
+    tls  = os.environ.get("TERAGUCHI_TLS", "1") != "0"
+
+    if not host:
+        return "Not connected. Call connect(host, port, username, password) first."
+
+    try:
+        kwargs = {"use_tls": tls} if adapter.name == "teraguchi" else {}
+        adapter.connect(host, port, user, pw, **kwargs)
+        return None
+    except Exception as exc:
+        return f"Auto-connect to {host}:{port} failed: {exc}"
+
+
 # ── Adapter management ────────────────────────────────────────────
 
 
@@ -200,13 +233,15 @@ def screenshot() -> str:
     """
     Capture the current remote desktop screen as a base64-encoded PNG.
 
-    Waits up to 5 seconds for the first frame if just connected.
-    Returns an error string if not connected or no frame received.
+    Auto-connects using TERAGUCHI_HOST/USER/PASS env vars if not already
+    connected.  Waits up to 5 seconds for the first frame after connecting.
+    Returns an error string if connection fails or no frame is received.
     """
-    adapter = registry.active
-    if not adapter.connected:
-        return f"Error: not connected -- call connect() first"
+    err = _ensure_connected()
+    if err:
+        return f"Error: {err}"
 
+    adapter = registry.active
     for _ in range(50):
         data = adapter.screenshot()
         if data:
@@ -219,9 +254,10 @@ def screenshot() -> str:
 @mcp.tool()
 def get_screen_size() -> dict:
     """Return the remote screen resolution as {width, height}."""
+    err = _ensure_connected()
+    if err:
+        return {"error": err}
     adapter = registry.active
-    if not adapter.connected:
-        return {"error": "not connected"}
     w, h = adapter.screen_size
     return {"width": w, "height": h}
 
@@ -308,31 +344,31 @@ def click(x: float, y: float, button: str = "left") -> str:
         y:      Vertical 0.0 (top) to 1.0 (bottom).
         button: "left" (default), "right", "middle".
     """
-    adapter = registry.active
-    if not adapter.connected:
-        return "Error: not connected"
+    err = _ensure_connected()
+    if err:
+        return f"Error: {err}"
     btn = {"left": 1, "middle": 2, "right": 3}.get(button.lower(), 1)
-    adapter.click(x, y, button=btn)
+    registry.active.click(x, y, button=btn)
     return "ok"
 
 
 @mcp.tool()
 def double_click(x: float, y: float) -> str:
     """Double-click at a normalized position (0.0-1.0)."""
-    adapter = registry.active
-    if not adapter.connected:
-        return "Error: not connected"
-    adapter.click(x, y, button=1, double=True)
+    err = _ensure_connected()
+    if err:
+        return f"Error: {err}"
+    registry.active.click(x, y, button=1, double=True)
     return "ok"
 
 
 @mcp.tool()
 def move_mouse(x: float, y: float) -> str:
     """Move mouse to normalized position without clicking."""
-    adapter = registry.active
-    if not adapter.connected:
-        return "Error: not connected"
-    adapter.move_mouse(x, y)
+    err = _ensure_connected()
+    if err:
+        return f"Error: {err}"
+    registry.active.move_mouse(x, y)
     return "ok"
 
 
@@ -346,9 +382,9 @@ def scroll(x: float, y: float, direction: str = "down", amount: int = 3) -> str:
         direction: "up", "down", "left", "right".
         amount:    Scroll steps (default 3).
     """
-    adapter = registry.active
-    if not adapter.connected:
-        return "Error: not connected"
+    err = _ensure_connected()
+    if err:
+        return f"Error: {err}"
     dx, dy = 0, 0
     if direction == "up":
         dy = -amount
@@ -358,7 +394,7 @@ def scroll(x: float, y: float, direction: str = "down", amount: int = 3) -> str:
         dx = -amount
     elif direction == "right":
         dx = amount
-    adapter.scroll(x, y, dx=dx, dy=dy)
+    registry.active.scroll(x, y, dx=dx, dy=dy)
     return "ok"
 
 
@@ -372,10 +408,10 @@ def drag(x1: float, y1: float, x2: float, y2: float,
         steps:       Mouse-move steps for smoothness (default 20).
         duration_ms: Total drag time in ms (default 300).
     """
-    adapter = registry.active
-    if not adapter.connected:
-        return "Error: not connected"
-    adapter.drag(x1, y1, x2, y2, steps=steps, duration_ms=duration_ms)
+    err = _ensure_connected()
+    if err:
+        return f"Error: {err}"
+    registry.active.drag(x1, y1, x2, y2, steps=steps, duration_ms=duration_ms)
     return f"ok -- dragged ({x1},{y1}) -> ({x2},{y2})"
 
 
@@ -390,10 +426,10 @@ def type_text(text: str) -> str:
     Supports printable ASCII, newline (\\n), tab (\\t).
     For special keys or combos use key() instead.
     """
-    adapter = registry.active
-    if not adapter.connected:
-        return "Error: not connected"
-    adapter.type_text(text)
+    err = _ensure_connected()
+    if err:
+        return f"Error: {err}"
+    registry.active.type_text(text)
     return f"ok -- typed {len(text)} characters"
 
 
@@ -409,11 +445,11 @@ def key(combo: str) -> str:
         "F1" through "F12"
         "left", "right", "up", "down", "home", "end", "pageup", "pagedown"
     """
-    adapter = registry.active
-    if not adapter.connected:
-        return "Error: not connected"
+    err = _ensure_connected()
+    if err:
+        return f"Error: {err}"
     try:
-        adapter.press_combo(combo)
+        registry.active.press_combo(combo)
         return f"ok -- pressed {combo!r}"
     except ValueError as e:
         return f"Error: {e}"
@@ -444,9 +480,10 @@ def audio_info() -> str:
           "receiving": true
         }
     """
+    err = _ensure_connected()
+    if err:
+        return f"Error: {err}"
     adapter = registry.active
-    if not adapter.connected:
-        return "Error: not connected"
     if hasattr(adapter, "audio_info"):
         return json.dumps(adapter.audio_info(), indent=2)
     return f"Not supported by {adapter.name} adapter (teraguchi only)"
@@ -480,9 +517,10 @@ def listen(duration_ms: int = 3000) -> str:
         tmp.write_bytes(wav)
         subprocess.run(["whisper", str(tmp), "--model", "base"])
     """
+    err = _ensure_connected()
+    if err:
+        return f"Error: {err}"
     adapter = registry.active
-    if not adapter.connected:
-        return "Error: not connected"
     if not hasattr(adapter, "listen_audio"):
         return f"Not supported by {adapter.name} adapter (teraguchi only)"
 
@@ -519,9 +557,10 @@ def clipboard_get() -> str:
     Works with teraguchi adapter (via SSH + xclip).
     Other adapters return 'not supported'.
     """
+    err = _ensure_connected()
+    if err:
+        return f"Error: {err}"
     adapter = registry.active
-    if not adapter.connected:
-        return "Error: not connected"
     if hasattr(adapter, "clipboard_get"):
         return adapter.clipboard_get()
     return f"Not supported by {adapter.name} adapter"
@@ -538,9 +577,10 @@ def clipboard_set(text: str) -> str:
     Args:
         text: Text to put on the clipboard.
     """
+    err = _ensure_connected()
+    if err:
+        return f"Error: {err}"
     adapter = registry.active
-    if not adapter.connected:
-        return "Error: not connected"
     if hasattr(adapter, "clipboard_set"):
         return adapter.clipboard_set(text)
     return f"Not supported by {adapter.name} adapter"
@@ -561,9 +601,10 @@ def run_remote(command: str, timeout_sec: int = 30) -> str:
         command:     Shell command string.
         timeout_sec: Max wait in seconds (default 30).
     """
+    err = _ensure_connected()
+    if err:
+        return f"Error: {err}"
     adapter = registry.active
-    if not adapter.connected:
-        return "Error: not connected"
     if hasattr(adapter, "run_remote"):
         return adapter.run_remote(command, timeout_sec=timeout_sec)
     return f"Not supported by {adapter.name} adapter (requires SSH)"
@@ -582,9 +623,10 @@ def find_element(description: str, action: str = "click") -> str:
                      Case-insensitive substring.
         action:      "click" (default) or "info" (return position only).
     """
+    err = _ensure_connected()
+    if err:
+        return f"Error: {err}"
     adapter = registry.active
-    if not adapter.connected:
-        return "Error: not connected"
 
     if not hasattr(adapter, "run_remote"):
         return f"Not supported by {adapter.name} adapter (requires SSH + pyatspi)"
@@ -650,20 +692,33 @@ print(json.dumps(results[:10]))
 
 
 def main():
+    # NOTE: We intentionally do NOT pre-connect on startup.
+    #
+    # Pre-connecting caused SIGABRT crashes on macOS (Apple Silicon + Rosetta 2):
+    # PyAV (ffmpeg x86_64) calls abort() when decoding incomplete H.264 frames
+    # (B-frames arriving before the first keyframe) in a background thread.
+    # The crash kills the whole MCP server process before Cursor can use any tools.
+    #
+    # Instead: env vars TERAGUCHI_HOST/USER/PASS/PORT/TLS are read here and
+    # stored so that the first call to connect() or any other tool that auto-
+    # connects can use them without the caller having to pass them explicitly.
     host = os.environ.get("TERAGUCHI_HOST", "")
     user = os.environ.get("TERAGUCHI_USER", "")
     pw   = os.environ.get("TERAGUCHI_PASS", "")
     port = int(os.environ.get("TERAGUCHI_PORT", "4443"))
     tls  = os.environ.get("TERAGUCHI_TLS", "1") != "0"
 
-    if host and user and pw:
-        try:
-            adapter = registry.active  # teraguchi by default
-            adapter.connect(host, port, user, pw, use_tls=tls, timeout=15.0)
-            w, h = adapter.screen_size
-            logger.warning("Pre-connected via %s to %s:%d -- %dx%d", adapter.name, host, port, w, h)
-        except Exception as e:
-            logger.warning("Pre-connect failed: %s -- use connect() tool", e)
+    # Store defaults so tools can auto-connect without arguments
+    if host:
+        os.environ.setdefault("TERAGUCHI_HOST", host)
+        os.environ.setdefault("TERAGUCHI_USER", user)
+        os.environ.setdefault("TERAGUCHI_PASS", pw)
+        os.environ.setdefault("TERAGUCHI_PORT", str(port))
+        os.environ.setdefault("TERAGUCHI_TLS",  "1" if tls else "0")
+        logger.warning(
+            "teraguchi MCP ready — env: host=%s port=%d tls=%s. "
+            "Call connect() or any action tool to establish the session.",
+            host, port, tls)
 
     mcp.run()
 
