@@ -320,16 +320,20 @@ class BookmarkDelegate(QStyledItemDelegate):
         dot_y = rect.center().y() - dot_size // 2
         painter.drawEllipse(dot_x, dot_y, dot_size, dot_size)
 
-        # Power icon (shown when bookmark has power management configured)
-        if bid in self._power_ids:
-            power_icon = icons.icon_power(theme.TEXT_MUTED)
-            # Place it to the left of the status dot
-            px = dot_x - 22 - 4
-            py = rect.center().y() - 10
-            hover = bool(option.state & QStyle.State_MouseOver)
-            if hover:
-                power_icon = icons.icon_power(theme.WARNING)
-            power_icon.paint(painter, px, py, 20, 20)
+        # Power icon — always shown on hover; solid/warm when configured, faint when not
+        hover = bool(option.state & QStyle.State_MouseOver)
+        has_power = bid in self._power_ids
+        px = dot_x - 22 - 4
+        py = rect.center().y() - 10
+        if has_power:
+            # Configured: always visible (secondary), warm on hover
+            color = theme.WARNING if hover else theme.TEXT_SECONDARY
+            icons.icon_power(color).paint(painter, px, py, 20, 20)
+        elif hover:
+            # Not configured: very faint hint on hover — click opens Power Settings
+            painter.setOpacity(0.3)
+            icons.icon_power(theme.TEXT_MUTED).paint(painter, px, py, 20, 20)
+            painter.setOpacity(1.0)
 
         painter.restore()
 
@@ -521,7 +525,10 @@ class BookmarkPanel(QWidget):
                         bid = item.data(Qt.UserRole)
                         if bid in self._power_ids:
                             self._show_power_menu(bid, event.globalPosition().toPoint())
-                            return True
+                        else:
+                            # Not configured yet — open Power Settings directly
+                            self._edit_power(bid)
+                        return True
         return super().eventFilter(obj, event)
 
     def _refresh(self, _query: str = ""):
